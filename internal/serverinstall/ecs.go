@@ -39,16 +39,7 @@ type ECSInstaller struct {
 }
 
 type ecsConfig struct {
-	ServerImage string `hcl:"server_image,optional"`
-
-	AdvertiseInternal bool   `hcl:"advertise_internal,optional"`
-	ImagePullPolicy   string `hcl:"image_pull_policy,optional"`
-	// How much CPU to assign to the containers
-	CPU string `hcl:"cpu,optional"`
-	// How much memory to assign to the containers
-	Memory string `hcl:"memory"`
-	// The soft limit (in MiB) of memory to reserve for the container
-	MemoryReservation string `hcl:"memory_reservation,optional"`
+	serverImage string `hcl:"server_image,optional"`
 
 	Region string `hcl:"region,optional"`
 
@@ -58,9 +49,6 @@ type ecsConfig struct {
 	// Port that your service is running on within the actual container.
 	// Defaults to port 3000.
 	ServicePort int64 `hcl:"service_port,optional"`
-
-	// Indicate that service should be deployed on an EC2 cluster.
-	EC2Cluster bool `hcl:"ec2_cluster,optional"`
 
 	// Name of the execution task IAM Role to associate with the ECS Service
 	ExecutionRoleName string `hcl:"execution_role_name,optional"`
@@ -256,8 +244,8 @@ func (i *ECSInstaller) Upgrade(
 	containerDef := taskDef.ContainerDefinitions[0]
 
 	upgradeImg := defaultServerImage
-	if i.config.ServerImage != "" {
-		upgradeImg = i.config.ServerImage
+	if i.config.serverImage != "" {
+		upgradeImg = i.config.serverImage
 	}
 	// assume upgrade to latest
 	if *containerDef.Image == defaultServerImage {
@@ -770,7 +758,7 @@ func (i *ECSInstaller) InstallRunner(
 		Essential: aws.Bool(true),
 		Command:   cmd,
 		Name:      aws.String("waypoint-runner"),
-		Image:     aws.String(i.config.ServerImage),
+		Image:     aws.String(i.config.serverImage),
 		PortMappings: []*ecs.PortMapping{
 			{
 				// TODO: configurable port
@@ -946,10 +934,7 @@ func (i *ECSInstaller) InstallRunner(
 	netCfg := &ecs.AwsVpcConfiguration{
 		Subnets:        subnets,
 		SecurityGroups: []*string{groupId},
-	}
-
-	if !i.config.EC2Cluster {
-		netCfg.AssignPublicIp = aws.String("ENABLED")
+		// AssignPublicIp: aws.String("ENABLED"),
 	}
 
 	createServiceInput := &ecs.CreateServiceInput{
@@ -1061,57 +1046,18 @@ func (i *ECSInstaller) InstallFlags(set *flag.Set) {
 		Usage:  "Configures the Execution role name to use.",
 	})
 
-	set.BoolVar(&flag.BoolVar{
-		Name:   "ecs-advertise-internal",
-		Target: &i.config.AdvertiseInternal,
-		Usage: "Advertise the internal service address rather than the external. " +
-			"This is useful if all your deployments will be able to access the private " +
-			"service address. This will default to false but will be automatically set to " +
-			"true if the external host is detected to be localhost.",
-	})
-
-	set.StringVar(&flag.StringVar{
-		Name:    "ecs-cpu-request",
-		Target:  &i.config.CPU,
-		Usage:   "Configures the requested CPU amount for the Waypoint server in ecs.",
-		Default: "100m",
-	})
-
-	set.StringVar(&flag.StringVar{
-		Name:    "ecs-mem-request",
-		Target:  &i.config.Memory,
-		Usage:   "Configures the requested memory amount for the Waypoint server in ecs.",
-		Default: "256Mi",
-	})
-
 	set.StringVar(&flag.StringVar{
 		Name:    "ecs-server-image",
-		Target:  &i.config.ServerImage,
+		Target:  &i.config.serverImage,
 		Usage:   "Docker image for the Waypoint server.",
 		Default: defaultServerImage,
 	})
 }
 
 func (i *ECSInstaller) UpgradeFlags(set *flag.Set) {
-	set.BoolVar(&flag.BoolVar{
-		Name:   "ecs-advertise-internal",
-		Target: &i.config.AdvertiseInternal,
-		Usage: "Advertise the internal service address rather than the external. " +
-			"This is useful if all your deployments will be able to access the private " +
-			"service address. This will default to false but will be automatically set to " +
-			"true if the external host is detected to be localhost.",
-	})
-
-	set.StringVar(&flag.StringVar{
-		Name:    "ecs-cpu-request",
-		Target:  &i.config.CPU,
-		Usage:   "Configures the requested CPU amount for the Waypoint server in ecs.",
-		Default: "100m",
-	})
-
 	set.StringVar(&flag.StringVar{
 		Name:    "ecs-server-image",
-		Target:  &i.config.ServerImage,
+		Target:  &i.config.serverImage,
 		Usage:   "Docker image for the Waypoint server.",
 		Default: defaultServerImage,
 	})
@@ -1270,10 +1216,6 @@ func (i *ECSInstaller) SetupCluster(
 			s.Status("Found existing ECS cluster: %s", cluster)
 			return cluster, nil
 		}
-	}
-
-	if i.config.EC2Cluster {
-		return "", fmt.Errorf("EC2 clusters can not be automatically created")
 	}
 
 	s.Status("Creating new ECS cluster: %s", cluster)
@@ -1468,7 +1410,7 @@ func (i *ECSInstaller) Launch(
 		Essential: aws.Bool(true),
 		Command:   cmd,
 		Name:      aws.String("waypoint-server"),
-		Image:     aws.String(i.config.ServerImage),
+		Image:     aws.String(i.config.serverImage),
 		PortMappings: []*ecs.PortMapping{
 			{
 				// TODO: configurable port
@@ -1655,66 +1597,58 @@ EFSLOOP:
 
 	var cpuShares int
 
+	// TODO const runtime
 	runtime := aws.String("FARGATE")
-	if i.config.EC2Cluster {
-		runtime = aws.String("EC2")
-		cpuShares = cpu
-	} else {
-		if mem == 0 {
-			return nil, fmt.Errorf("Memory value required for fargate")
+	if mem == 0 {
+		return nil, fmt.Errorf("Memory value required for fargate")
+	}
+	cpuValues, ok := fargateResources[mem]
+	if !ok {
+		var (
+			allValues  []int
+			goodValues []string
+		)
+
+		for k := range fargateResources {
+			allValues = append(allValues, k)
 		}
-		cpuValues, ok := fargateResources[mem]
-		if !ok {
-			var (
-				allValues  []int
-				goodValues []string
-			)
 
-			for k := range fargateResources {
-				allValues = append(allValues, k)
+		sort.Ints(allValues)
+
+		for _, k := range allValues {
+			goodValues = append(goodValues, strconv.Itoa(k))
+		}
+
+		return nil, fmt.Errorf("Invalid memory value: %d (valid values: %s)",
+			mem, strings.Join(goodValues, ", "))
+	}
+
+	if cpu == 0 {
+		cpuShares = cpuValues[0]
+	} else {
+		var (
+			valid      bool
+			goodValues []string
+		)
+
+		for _, c := range cpuValues {
+			goodValues = append(goodValues, strconv.Itoa(c))
+			if c == cpu {
+				valid = true
+				break
 			}
+		}
 
-			sort.Ints(allValues)
-
-			for _, k := range allValues {
-				goodValues = append(goodValues, strconv.Itoa(k))
-			}
-
-			return nil, fmt.Errorf("Invalid memory value: %d (valid values: %s)",
+		if !valid {
+			return nil, fmt.Errorf("Invalid cpu value: %d (valid values: %s)",
 				mem, strings.Join(goodValues, ", "))
 		}
 
-		if cpu == 0 {
-			cpuShares = cpuValues[0]
-		} else {
-			var (
-				valid      bool
-				goodValues []string
-			)
-
-			for _, c := range cpuValues {
-				goodValues = append(goodValues, strconv.Itoa(c))
-				if c == cpu {
-					valid = true
-					break
-				}
-			}
-
-			if !valid {
-				return nil, fmt.Errorf("Invalid cpu value: %d (valid values: %s)",
-					mem, strings.Join(goodValues, ", "))
-			}
-
-			cpuShares = cpu
-		}
+		cpuShares = cpu
 	}
 
+	// TODO default cpu/mem
 	cpus := aws.String(strconv.Itoa(cpuShares))
-	// on EC2 launch type, `Cpu` is an optional field, so we leave it nil if it is 0
-	if i.config.EC2Cluster && cpuShares == 0 {
-		cpus = nil
-	}
-
 	mems := strconv.Itoa(mem)
 
 	// TODO config family
@@ -1781,10 +1715,7 @@ EFSLOOP:
 	netCfg := &ecs.AwsVpcConfiguration{
 		Subnets:        subnets,
 		SecurityGroups: []*string{sgecsport},
-	}
-
-	if !i.config.EC2Cluster {
-		netCfg.AssignPublicIp = aws.String("ENABLED")
+		// AssignPublicIp: aws.String("ENABLED"),
 	}
 
 	createServiceInput := &ecs.CreateServiceInput{
@@ -2069,17 +2000,12 @@ func buildLoggingOptions(
 }
 
 type Logging struct {
-	CreateGroup bool `hcl:"create_group,optional"`
-
-	StreamPrefix string `hcl:"stream_prefix,optional"`
-
-	DateTimeFormat string `hcl:"datetime_format,optional"`
-
+	CreateGroup      bool   `hcl:"create_group,optional"`
+	StreamPrefix     string `hcl:"stream_prefix,optional"`
+	DateTimeFormat   string `hcl:"datetime_format,optional"`
 	MultilinePattern string `hcl:"multiline_pattern,optional"`
-
-	Mode string `hcl:"mode,optional"`
-
-	MaxBufferSize string `hcl:"max_buffer_size,optional"`
+	Mode             string `hcl:"mode,optional"`
+	MaxBufferSize    string `hcl:"max_buffer_size,optional"`
 }
 
 func (i *ECSInstaller) SetupExecutionRole(

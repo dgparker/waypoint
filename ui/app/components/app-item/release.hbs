@@ -16,7 +16,7 @@
       </span>
     </small>
   </LinkTo>
-
+  <StatusBadge @state={{@release.status.state}}/>
   {{#if (and @isLatest @release.url)}}
     <ExternalLink href={{@release.url}} class="button button--primary button--external-link">
       <span>{{@release.url}}</span>

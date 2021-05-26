@@ -127,6 +127,10 @@ div.app-card-item {
   }
 
   .button {
+    margin-left: scale.$sm-2;
+  }
+
+  .badge-status {
     margin-left: auto;
   }
 }

@@ -18,6 +18,7 @@ import {
   StatusReport,
   ListStatusReportsRequest,
   ListStatusReportsResponse,
+  GetLatestStatusReportRequest,
 } from 'waypoint-pb';
 import config from 'waypoint/config/environment';
 

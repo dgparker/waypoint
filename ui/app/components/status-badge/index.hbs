@@ -4,7 +4,7 @@
     {{t (concat 'status_badge.' this.statusClass '.text')}}
     {{yield}}
   {{/unless}}
-  <EmberTooltip @side="top">
+  <EmberTooltip @side="top-end">
     {{t (concat 'status_badge.' this.statusClass '.tooltip')}}
   </EmberTooltip>
 </b>

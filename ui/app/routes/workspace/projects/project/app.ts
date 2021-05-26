@@ -58,6 +58,9 @@ export default class App extends Route {
       builds: ObjectPromiseProxy.create({
         promise: resolve(this.api.listBuilds(wsRef, appRef)),
       }),
+      statusReports: ObjectPromiseProxy.create({
+        promise: resolve(this.api.listStatusReports(wsRef, appRef)),
+      }),
     });
   }
 

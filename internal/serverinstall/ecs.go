@@ -29,6 +29,11 @@ import (
 	"github.com/ryboe/q"
 )
 
+const (
+	defaultServerLogGroup = "waypoint-server-logs"
+	defaultRunnerLogGroup = "waypoint-runner-logs"
+)
+
 type ECSInstaller struct {
 	config ecsConfig
 }
@@ -76,14 +81,14 @@ func (i *ECSInstaller) Install(
 	sg := ui.StepGroup()
 	defer sg.Wait()
 
-	s := sg.Add("Inspecting ECS cluster...")
+	s := sg.Add("Inspecting existing ECS clusters...")
 	defer func() { s.Abort() }()
 	log.Info("Starting lifecycle")
 
 	var (
 		sess *session.Session
 
-		executionRole, taskRole, cluster, serverLogGroup string
+		executionRole, cluster, serverLogGroup string
 
 		dep *ecsServer
 
@@ -97,16 +102,11 @@ func (i *ECSInstaller) Install(
 		q.Q("->Total time:", time.Since(start).Minutes())
 	}()
 
-	// TODO: config this
-	taskRole = "arn:aws:iam::797645259670:role/waypoint-ecs-task-role"
-
 	ulid, err := component.Id()
 	if err != nil {
 		return nil, err
 	}
 
-	serverLogGroup = "waypoint-server-logs"
-	// TODO: reuse this for runner setup
 	lf := &Lifecycle{
 		Init: func(s LifecycleStatus) error {
 			sess, err = utils.GetSession(&utils.SessionConfig{
@@ -131,7 +131,7 @@ func (i *ECSInstaller) Install(
 				return err
 			}
 
-			serverLogGroup, err = i.SetupLogs(ctx, s, log, sess, ulid, serverLogGroup)
+			serverLogGroup, err = i.SetupLogs(ctx, s, log, sess, ulid, defaultServerLogGroup)
 			if err != nil {
 				return err
 			}
@@ -140,7 +140,7 @@ func (i *ECSInstaller) Install(
 		},
 
 		Run: func(s LifecycleStatus) error {
-			dep, err = i.Launch(ctx, s, log, ui, sess, efsId, executionRole, taskRole, cluster, serverLogGroup, ulid)
+			dep, err = i.Launch(ctx, s, log, ui, sess, efsId, executionRole, cluster, serverLogGroup, ulid)
 			return err
 		},
 
@@ -297,37 +297,15 @@ func (i *ECSInstaller) Upgrade(
 			Volumes: taskDef.Volumes,
 		}
 
-		var taskOut *ecs.RegisterTaskDefinitionOutput
 		ecsSvc := ecs.New(sess)
-		// AWS is eventually consistent so even though we probably created the
-		// resources that are referenced by the task definition, it can error out if
-		// we try to reference those resources too quickly. So we're forced to guard
-		// actions which reference other AWS services with loops like this.
-		for i := 0; i < 30; i++ {
-			taskOut, err = ecsSvc.RegisterTaskDefinition(&registerTaskDefinitionInput)
-			if err == nil {
-				break
-			}
-
-			// if we encounter an unrecoverable error, exit now.
-			if aerr, ok := err.(awserr.Error); ok {
-				switch aerr.Code() {
-				case "ResourceConflictException":
-					return nil, err
-				}
-			}
-
-			// otherwise sleep and try again
-			time.Sleep(2 * time.Second)
-		}
-
+		taskDef, err := registerTaskDefinition(&registerTaskDefinitionInput, ecsSvc)
 		if err != nil {
 			return nil, err
 		}
 
-		_, err := ecsSvc.UpdateService(&ecs.UpdateServiceInput{
+		_, err = ecsSvc.UpdateService(&ecs.UpdateServiceInput{
 			Cluster:        &clusterArn,
-			TaskDefinition: taskOut.TaskDefinition.TaskDefinitionArn,
+			TaskDefinition: taskDef.TaskDefinitionArn,
 			Service:        serverSvc.ServiceName,
 		})
 		if err != nil {
@@ -718,8 +696,6 @@ func (i *ECSInstaller) InstallRunner(
 
 	s := sg.Add("Starting Runner installation")
 	defer func() { s.Abort() }()
-	// TODO: dynamic log group
-	runnerLogGroup := "waypoint-runner-logs"
 	var logGroup string
 	// TODO: reuse this for runner setup
 	lf := &Lifecycle{
@@ -732,7 +708,7 @@ func (i *ECSInstaller) InstallRunner(
 				return err
 			}
 
-			logGroup, err = i.SetupLogs(ctx, s, log, sess, ulid, runnerLogGroup)
+			logGroup, err = i.SetupLogs(ctx, s, log, sess, ulid, defaultRunnerLogGroup)
 			if err != nil {
 				return err
 			}
@@ -911,38 +887,18 @@ func (i *ECSInstaller) InstallRunner(
 		},
 	}
 
-	var taskOut *ecs.RegisterTaskDefinitionOutput
-
 	ecsSvc := ecs.New(sess)
-	// AWS is eventually consistent so even though we probably created the
-	// resources that are referenced by the task definition, it can error out if
-	// we try to reference those resources too quickly. So we're forced to guard
-	// actions which reference other AWS services with loops like this.
-	for i := 0; i < 30; i++ {
-		taskOut, err = ecsSvc.RegisterTaskDefinition(&registerTaskDefinitionInput)
-		q.Q("-> task registration err:", err)
-		if err == nil {
-			break
-		}
-
-		// if we encounter an unrecoverable error, exit now.
-		if aerr, ok := err.(awserr.Error); ok {
-			switch aerr.Code() {
-			case "ResourceConflictException":
-				return err
-			}
-		}
-
-		// otherwise sleep and try again
-		time.Sleep(2 * time.Second)
+	taskDef, err := registerTaskDefinition(&registerTaskDefinitionInput, ecsSvc)
+	if err != nil {
+		return err
 	}
 
 	if err != nil {
 		return err
 	}
-	taskDefArn := *taskOut.TaskDefinition.TaskDefinitionArn
+	taskDefArn := *taskDef.TaskDefinitionArn
 	s.Status("Creating Service...")
-	log.Debug("creating service", "arn", *taskOut.TaskDefinition.TaskDefinitionArn)
+	log.Debug("creating service", "arn", *taskDef.TaskDefinitionArn)
 
 	ec2srv := ec2.New(sess)
 
@@ -1367,17 +1323,13 @@ func (i *ECSInstaller) SetupEFS(
 		return "", err
 	}
 
-	s.Update("Created new EFS file system: %s", *fsd.FileSystemId)
-
-	fs, err := efsSvc.DescribeFileSystems(&efs.DescribeFileSystemsInput{
+	_, err = efsSvc.DescribeFileSystems(&efs.DescribeFileSystemsInput{
 		CreationToken: aws.String(id),
 	})
 	if err != nil {
 		return "", err
 	}
-	if len(fs.FileSystems) != 1 {
-		return "", fmt.Errorf("unexpected count of file systems: %d", len(fs.FileSystems))
-	}
+	s.Update("Created new EFS file system: %s", *fsd.FileSystemId)
 
 	return *fsd.FileSystemId, nil
 }
@@ -1442,7 +1394,7 @@ func (i *ECSInstaller) Launch(
 	ui terminal.UI,
 	sess *session.Session,
 	efsId string,
-	executionRoleArn, taskRoleArn, clusterName, logGroup, ulid string,
+	executionRoleArn, clusterName, logGroup, ulid string,
 ) (*ecsServer, error) {
 	id, err := component.Id()
 	if err != nil {
@@ -1570,6 +1522,7 @@ func (i *ECSInstaller) Launch(
 	}
 
 	vpcId := subnetInfo.Subnets[0].VpcId
+	q.Q("-> vpcId:", vpcId)
 
 	sgName := "waypoint-server-inbound"
 	s.Status("Setting up security group...")
@@ -1802,30 +1755,7 @@ EFSLOOP:
 		},
 	}
 
-	var taskOut *ecs.RegisterTaskDefinitionOutput
-
-	// AWS is eventually consistent so even though we probably created the
-	// resources that are referenced by the task definition, it can error out if
-	// we try to reference those resources too quickly. So we're forced to guard
-	// actions which reference other AWS services with loops like this.
-	for i := 0; i < 30; i++ {
-		taskOut, err = ecsSvc.RegisterTaskDefinition(&registerTaskDefinitionInput)
-		if err == nil {
-			break
-		}
-
-		// if we encounter an unrecoverable error, exit now.
-		if aerr, ok := err.(awserr.Error); ok {
-			switch aerr.Code() {
-			case "ResourceConflictException":
-				return nil, err
-			}
-		}
-
-		// otherwise sleep and try again
-		time.Sleep(2 * time.Second)
-	}
-
+	taskDef, err := registerTaskDefinition(&registerTaskDefinitionInput, ecsSvc)
 	if err != nil {
 		return nil, err
 	}
@@ -1841,11 +1771,11 @@ EFSLOOP:
 		L.Debug("using a shortened value for service name due to AWS's length limits", "serviceName", serviceName)
 	}
 
-	taskDefArn := *taskOut.TaskDefinition.TaskDefinitionArn
+	taskDefArn := *taskDef.TaskDefinitionArn
 
 	// Create the service
 	s.Update("Creating Service...")
-	L.Debug("creating service", "arn", *taskOut.TaskDefinition.TaskDefinitionArn)
+	L.Debug("creating service", "arn", *taskDef.TaskDefinitionArn)
 
 	// resume creating the service
 	netCfg := &ecs.AwsVpcConfiguration{
@@ -2457,4 +2387,31 @@ func defaultSubnets(ctx context.Context, sess *session.Session) ([]*string, erro
 	}
 
 	return subnets, nil
+}
+
+func registerTaskDefinition(def *ecs.RegisterTaskDefinitionInput, ecsSvc *ecs.ECS) (*ecs.TaskDefinition, error) {
+	// AWS is eventually consistent so even though we probably created the
+	// resources that are referenced by the task definition, it can error out if
+	// we try to reference those resources too quickly. So we're forced to guard
+	// actions which reference other AWS services with loops like this.
+	var taskOut *ecs.RegisterTaskDefinitionOutput
+	var err error
+	for i := 0; i < 30; i++ {
+		taskOut, err = ecsSvc.RegisterTaskDefinition(def)
+		if err == nil {
+			break
+		}
+
+		// if we encounter an unrecoverable error, exit now.
+		if aerr, ok := err.(awserr.Error); ok {
+			switch aerr.Code() {
+			case "ResourceConflictException":
+				return nil, err
+			}
+		}
+
+		// otherwise sleep and try again
+		time.Sleep(2 * time.Second)
+	}
+	return taskOut.TaskDefinition, nil
 }

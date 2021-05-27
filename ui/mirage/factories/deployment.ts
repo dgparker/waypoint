@@ -28,6 +28,22 @@ export default Factory.extend({
     },
   }),
 
+  docker: trait({
+    component: association('platform', 'docker'),
+  }),
+
+  nomad: trait({
+    component: association('platform', 'nomad'),
+  }),
+
+  'nomad-jobspec': trait({
+    component: association('platform', 'nomad-jobspec'),
+  }),
+
+  kubernetes: trait({
+    component: association('platform', 'kubernetes'),
+  }),
+
   'seconds-old-success': trait({
     status: association('random', 'success', 'seconds-old'),
   }),

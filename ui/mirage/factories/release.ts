@@ -24,6 +24,18 @@ export default Factory.extend({
     url: 'https://wildly-intent-honeybee.waypoint.run',
   }),
 
+  nomad: trait({
+    component: association('release-manager', { name: 'nomad' }),
+  }),
+
+  'nomad-jobspec': trait({
+    component: association('release-manager', { name: 'nomad-jobspec' }),
+  }),
+
+  kubernetes: trait({
+    component: association('release-manager', { name: 'kubernetes' }),
+  }),
+
   'seconds-old-success': trait({
     status: association('random', 'success', 'seconds-old'),
   }),

@@ -22,6 +22,14 @@ export default Factory.extend({
     status: association('random'),
   }),
 
+  docker: trait({
+    component: association('builder', 'docker'),
+  }),
+
+  pack: trait({
+    component: association('builder', 'pack'),
+  }),
+
   'seconds-old-success': trait({
     status: association('random', 'success', 'seconds-old'),
   }),

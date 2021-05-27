@@ -10,6 +10,10 @@ export default Factory.extend({
     name: () => faker.hacker.noun(),
   }),
 
+  'with-remote-runners': trait({
+    remoteEnabled: true,
+  }),
+
   // This is our primary demo trait for development mode
   'marketing-public': trait({
     name: 'marketing-public',
@@ -62,9 +66,5 @@ export default Factory.extend({
         deployment: deployments[0],
       });
     },
-  }),
-
-  'with-remote-runners': trait({
-    remoteEnabled: true,
   }),
 });

@@ -3,25 +3,25 @@ import { tracked } from '@glimmer/tracking';
 import { Deployment } from 'waypoint-pb';
 import { action } from '@ember/object';
 export default class WorkspaceProjectsProjectAppDeployments extends Controller {
-  queryParams = ['destroyed']
+  queryParams = ['destroyed'];
 
   @tracked destroyed = false;
 
-  get hasMoreDeployments() {
-    return this.model.filter((deployment: Deployment.AsObject) => deployment.state == 4).length > 0
+  get hasMoreDeployments(): boolean {
+    return this.model.filter((deployment: Deployment.AsObject) => deployment.state == 4).length > 0;
   }
 
-  get deployments() {
+  get deployments(): Deployment.AsObject[] {
     if (this.destroyed) {
-      return this.model
+      return this.model;
     } else {
-      const deploys = this.model.filter((deployment: Deployment.AsObject) => deployment.state != 4)
+      let deploys = this.model.filter((deployment: Deployment.AsObject) => deployment.state != 4);
       return deploys;
     }
   }
 
   @action
-  showDestroyed() {
+  showDestroyed(): void {
     this.destroyed = true;
   }
 }

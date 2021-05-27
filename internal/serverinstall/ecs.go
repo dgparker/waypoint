@@ -1036,9 +1036,15 @@ func (i *ECSInstaller) SetupCluster(
 
 	_, err = ecsSvc.CreateCluster(&ecs.CreateClusterInput{
 		ClusterName: aws.String(cluster),
+		// we need to tag with both the server and runner names, so we can properly
+		// cleanup
 		Tags: []*ecs.Tag{
 			{
 				Key:   aws.String(serverName),
+				Value: aws.String(ulid),
+			},
+			{
+				Key:   aws.String(runnerName),
 				Value: aws.String(ulid),
 			},
 		},

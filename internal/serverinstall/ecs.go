@@ -25,7 +25,6 @@ import (
 	"github.com/hashicorp/waypoint/internal/pkg/flag"
 	pb "github.com/hashicorp/waypoint/internal/server/gen"
 	"github.com/hashicorp/waypoint/internal/serverconfig"
-	"github.com/ryboe/q"
 )
 
 const (
@@ -92,16 +91,10 @@ func (i *ECSInstaller) Install(
 
 		netInfo *networkInformation
 
-		dep *ecsServer
+		server *ecsServer
 
 		err error
 	)
-
-	// TODO - debugging
-	start := time.Now()
-	defer func() {
-		q.Q("->Total time:", time.Since(start).Minutes())
-	}()
 
 	lf := &Lifecycle{
 		Init: func(s LifecycleStatus) error {
@@ -141,7 +134,7 @@ func (i *ECSInstaller) Install(
 		},
 
 		Run: func(s LifecycleStatus) error {
-			dep, err = i.Launch(ctx, s, log, ui, sess, efsInfo, netInfo, executionRole, cluster, serverLogGroup, ulid)
+			server, err = i.Launch(ctx, s, log, ui, sess, efsInfo, netInfo, executionRole, cluster, serverLogGroup, ulid)
 			return err
 		},
 
@@ -157,8 +150,8 @@ func (i *ECSInstaller) Install(
 	var advertiseAddr pb.ServerConfig_AdvertiseAddr
 	var httpAddr string
 	var grpcAddr string
-	grpcAddr = fmt.Sprintf("%s:%s", dep.Url, grpcPort)
-	httpAddr = fmt.Sprintf("%s:%s", dep.Url, httpPort)
+	grpcAddr = fmt.Sprintf("%s:%s", server.Url, grpcPort)
+	httpAddr = fmt.Sprintf("%s:%s", server.Url, httpPort)
 	// Set our advertise address
 	advertiseAddr.Addr = grpcAddr
 	advertiseAddr.Tls = true
@@ -1061,7 +1054,6 @@ func (i *ECSInstaller) SetupNetworking(
 		aws.Int64(int64(grpcPort)),
 		aws.Int64(int64(httpPort)),
 		aws.Int64(int64(2049)), // EFS File system port
-		aws.Int64(int64(80)),   // web - TODO check thsi
 	}
 
 	sgID, err := createSG(ctx, s, sess, defaultSecurityGroupName, vpcID, ulid, ports)
@@ -1357,9 +1349,6 @@ func (i *ECSInstaller) Launch(
 
 	// Create mount points for the EFS file system. The EFS mount targets need to
 	// existin in a 1:1 pair with the subnets in use.
-
-	time.Sleep(3 * time.Second)
-
 	s.Status("Creating ECS Service and Tasks...")
 	L.Debug("registering task definition", "ulid", ulid)
 
@@ -1443,47 +1432,16 @@ func (i *ECSInstaller) Launch(
 
 	s.Status("Creating ECS Service (%s, cluster-name: %s)", serviceName, clusterName)
 
-	var servOut *ecs.CreateServiceOutput
-
-	// AWS is eventually consistent so even though we probably created the
-	// resources that are referenced by the service, it can error out if we try to
-	// reference those resources too quickly. So we're forced to guard actions
-	// which reference other AWS services with loops like this.
-	for i := 0; i < 30; i++ {
-		servOut, err = ecsSvc.CreateService(createServiceInput)
-		if err == nil {
-			break
-		}
-
-		// if we encounter an unrecoverable error, exit now.
-		if aerr, ok := err.(awserr.Error); ok {
-			switch aerr.Code() {
-			case "AccessDeniedException", "UnsupportedFeatureException",
-				"PlatformUnknownException",
-				"PlatformTaskDefinitionIncompatibilityException":
-				return nil, err
-			}
-		}
-
-		// otherwise sleep and try again
-		time.Sleep(2 * time.Second)
-	}
-
+	service, err := createService(createServiceInput, ecsSvc)
 	if err != nil {
 		return nil, err
 	}
 
 	s.Update("Created ECS Service (%s, cluster-name: %s)", serviceName, clusterName)
-	L.Debug("service started", "arn", servOut.Service.ServiceArn)
+	L.Debug("service started", "arn", service.ServiceArn)
 
-	dep := &ecsServer{
-		Url:                nlb.publicDNS,
-		Cluster:            clusterName,
-		TaskArn:            taskDefArn,
-		HttpTargetGroupArn: nlb.httpTgArn,
-		ServiceArn:         *servOut.Service.ServiceArn,
-	}
-
+	// after the service is created with the specified target groups, the load
+	// balancer will start making health checks.
 	s.Update("Waiting for target group to be healthy...")
 	elbsrv := elbv2.New(sess)
 	var healthy bool
@@ -1494,10 +1452,8 @@ func (i *ECSInstaller) Launch(
 		if err != nil {
 			return nil, err
 		}
-		if len(health.TargetHealthDescriptions) == 0 {
-			// return nil, fmt.Errorf("too many target healths: %d", len(health.TargetHealthDescriptions))
-		} else {
-
+		// it's possible no health descriptions are available yet
+		if len(health.TargetHealthDescriptions) > 0 {
 			// grab the first, most recent
 			hd := health.TargetHealthDescriptions[0]
 
@@ -1513,7 +1469,14 @@ func (i *ECSInstaller) Launch(
 		return nil, fmt.Errorf("no healthy target group")
 	}
 	s.Status("Service launched!")
-	return dep, nil
+
+	return &ecsServer{
+		Url:                nlb.publicDNS,
+		Cluster:            clusterName,
+		TaskArn:            taskDefArn,
+		HttpTargetGroupArn: nlb.httpTgArn,
+		ServiceArn:         *service.ServiceArn,
+	}, nil
 }
 
 func createSG(
@@ -1787,14 +1750,14 @@ func createNLB(
 	elbsrv := elbv2.New(sess)
 
 	ctgGPRC, err := elbsrv.CreateTargetGroup(&elbv2.CreateTargetGroupInput{
-		Name:                       aws.String("waypoint-server-grpc"),
-		Port:                       grpcPort,
-		Protocol:                   aws.String("TCP"),
-		TargetType:                 aws.String("ip"),
-		HealthCheckIntervalSeconds: aws.Int64(int64(10)),
-		HealthyThresholdCount:      aws.Int64(int64(2)),
-		UnhealthyThresholdCount:    aws.Int64(int64(2)),
-		VpcId:                      vpcId,
+		Name:       aws.String("waypoint-server-grpc"),
+		Port:       grpcPort,
+		Protocol:   aws.String("TCP"),
+		TargetType: aws.String("ip"),
+		// HealthCheckIntervalSeconds: aws.Int64(int64(10)),
+		HealthyThresholdCount:   aws.Int64(int64(2)),
+		UnhealthyThresholdCount: aws.Int64(int64(2)),
+		VpcId:                   vpcId,
 		Tags: []*elbv2.Tag{
 			{
 				Key:   aws.String(serverName),
@@ -1807,16 +1770,16 @@ func createNLB(
 	}
 
 	htgGPRC, err := elbsrv.CreateTargetGroup(&elbv2.CreateTargetGroupInput{
-		Name:                       aws.String("waypoint-server-http"),
-		HealthCheckProtocol:        aws.String(elbv2.ProtocolEnumHttps),
-		HealthCheckPath:            aws.String("/auth"),
-		HealthCheckIntervalSeconds: aws.Int64(int64(10)),
-		HealthyThresholdCount:      aws.Int64(int64(2)),
-		UnhealthyThresholdCount:    aws.Int64(int64(2)),
-		Port:                       aws.Int64(int64(9702)),
-		Protocol:                   aws.String("TCP"),
-		TargetType:                 aws.String("ip"),
-		VpcId:                      vpcId,
+		Name:                aws.String("waypoint-server-http"),
+		HealthCheckProtocol: aws.String(elbv2.ProtocolEnumHttps),
+		HealthCheckPath:     aws.String("/auth"),
+		// HealthCheckIntervalSeconds: aws.Int64(int64(10)),
+		HealthyThresholdCount:   aws.Int64(int64(2)),
+		UnhealthyThresholdCount: aws.Int64(int64(2)),
+		Port:                    aws.Int64(int64(9702)),
+		Protocol:                aws.String("TCP"),
+		TargetType:              aws.String("ip"),
+		VpcId:                   vpcId,
 		Tags: []*elbv2.Tag{
 			{
 				Key:   aws.String(serverName),
@@ -2221,13 +2184,25 @@ func (i *ECSInstaller) LaunchRunner(
 
 	s.Update("Creating ECS Service (%s)", runnerName)
 
+	svc, err := createService(createServiceInput, ecsSvc)
+	if err != nil {
+		return nil, err
+	}
+
+	return svc.ClusterArn, nil
+}
+
+func createService(serviceInput *ecs.CreateServiceInput, ecsSvc *ecs.ECS) (*ecs.Service, error) {
 	// AWS is eventually consistent so even though we probably created the
 	// resources that are referenced by the service, it can error out if we try to
 	// reference those resources too quickly. So we're forced to guard actions
 	// which reference other AWS services with loops like this.
-	var servOut *ecs.CreateServiceOutput
+	var (
+		servOut *ecs.CreateServiceOutput
+		err     error
+	)
 	for i := 0; i < 30; i++ {
-		servOut, err = ecsSvc.CreateService(createServiceInput)
+		servOut, err = ecsSvc.CreateService(serviceInput)
 		if err == nil {
 			break
 		}
@@ -2249,5 +2224,5 @@ func (i *ECSInstaller) LaunchRunner(
 	if err != nil {
 		return nil, err
 	}
-	return servOut.Service.ClusterArn, nil
+	return servOut.Service, nil
 }

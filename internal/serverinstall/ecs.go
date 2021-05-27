@@ -42,6 +42,12 @@ const (
 
 var ulid string
 
+func init() {
+	// generate a ULID for use in FileSystem creation and unique tag value for
+	// this installation
+	ulid, _ = component.Id()
+}
+
 type ECSInstaller struct {
 	config ecsConfig
 }
@@ -80,9 +86,11 @@ func (i *ECSInstaller) Install(
 	var (
 		sess *session.Session
 
-		executionRole, cluster, serverLogGroup, efsId string
+		executionRole, cluster, serverLogGroup string
 
-		netInfo *networkInfo
+		efsInfo *efsInformation
+
+		netInfo *networkInformation
 
 		dep *ecsServer
 
@@ -114,7 +122,7 @@ func (i *ECSInstaller) Install(
 				return err
 			}
 
-			efsId, err = i.SetupEFS(ctx, s, sess, ulid)
+			efsInfo, err = i.SetupEFS(ctx, s, sess, netInfo, ulid)
 			if err != nil {
 				return err
 			}
@@ -133,7 +141,7 @@ func (i *ECSInstaller) Install(
 		},
 
 		Run: func(s LifecycleStatus) error {
-			dep, err = i.Launch(ctx, s, log, ui, sess, efsId, netInfo, executionRole, cluster, serverLogGroup, ulid)
+			dep, err = i.Launch(ctx, s, log, ui, sess, efsInfo, netInfo, executionRole, cluster, serverLogGroup, ulid)
 			return err
 		},
 
@@ -301,7 +309,6 @@ func (i *ECSInstaller) Upgrade(
 		})
 	}
 
-	s.Done()
 	var contextConfig clicontext.Config
 	var advertiseAddr pb.ServerConfig_AdvertiseAddr
 	advertiseAddr.Addr = serverCfg.Address
@@ -844,8 +851,25 @@ func (i *ECSInstaller) HasRunner(
 	ctx context.Context,
 	opts *InstallOpts,
 ) (bool, error) {
+	log := opts.Log
+	sess, err := utils.GetSession(&utils.SessionConfig{
+		Region: i.config.region,
+		Logger: log,
+	})
+	if err != nil {
+		return false, err
+	}
+	ecsSvc := ecs.New(sess)
+	// query what subnets and vpc information from the server service
+	services, err := ecsSvc.DescribeServices(&ecs.DescribeServicesInput{
+		Cluster:  aws.String(i.config.cluster),
+		Services: []*string{aws.String(runnerName)},
+	})
+	if err != nil {
+		return false, err
+	}
 
-	return false, nil
+	return len(services.Services) > 0, nil
 }
 
 func (i *ECSInstaller) InstallFlags(set *flag.Set) {
@@ -1022,7 +1046,7 @@ func (i *ECSInstaller) SetupNetworking(
 	s LifecycleStatus,
 	sess *session.Session,
 	ulid string,
-) (*networkInfo, error) {
+) (*networkInformation, error) {
 
 	s.Status("Establishing subnets and security group...")
 	subnets, vpcID, err := i.subnetInfo(ctx, s, sess)
@@ -1044,7 +1068,7 @@ func (i *ECSInstaller) SetupNetworking(
 	if err != nil {
 		return nil, err
 	}
-	return &networkInfo{
+	return &networkInformation{
 		vpcID:   vpcID,
 		subnets: subnets,
 		sgID:    sgID,
@@ -1101,8 +1125,9 @@ func (i *ECSInstaller) SetupEFS(
 	ctx context.Context,
 	s LifecycleStatus,
 	sess *session.Session,
+	netInfo *networkInformation,
 	ulid string,
-) (string, error) {
+) (*efsInformation, error) {
 	efsSvc := efs.New(sess)
 
 	s.Status("Creating new EFS file system...")
@@ -1117,38 +1142,116 @@ func (i *ECSInstaller) SetupEFS(
 		},
 	})
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 
 	_, err = efsSvc.DescribeFileSystems(&efs.DescribeFileSystemsInput{
 		CreationToken: aws.String(ulid),
 	})
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	s.Update("Created new EFS file system: %s", *fsd.FileSystemId)
 
-	return *fsd.FileSystemId, nil
-}
+	for i := 0; i < 10; i++ {
+		fsList, err := efsSvc.DescribeFileSystems(&efs.DescribeFileSystemsInput{
+			FileSystemId: fsd.FileSystemId,
+		})
+		if err != nil {
+			return nil, err
+		}
+		if len(fsList.FileSystems) == 0 {
+			return nil, fmt.Errorf("file system (%s) not found", *fsd.FileSystemId)
+		}
+		// check the status of the first one
+		fs := fsList.FileSystems[0]
+		switch *fs.LifeCycleState {
+		case efs.LifeCycleStateDeleted, efs.LifeCycleStateDeleting:
+			return nil, fmt.Errorf("files system is deleting/deleted")
+		case efs.LifeCycleStateAvailable:
+			break
+		}
+		time.Sleep(2 * time.Second)
+	}
 
-const rolePolicy = `{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-		  "Sid": "",
-      "Effect": "Allow",
-      "Principal": {
-        "Service": "ecs-tasks.amazonaws.com"
-      },
-      "Action": "sts:AssumeRole"
-    }
-  ]
-}`
+	s.Status("Creating EFS Mount targets...")
 
-func init() {
-	// generate a ULID for use in FileSystem creation and unique tag value for
-	// this installation
-	ulid, _ = component.Id()
+	// poll for available
+	for _, sub := range netInfo.subnets {
+		_, err := efsSvc.CreateMountTarget(&efs.CreateMountTargetInput{
+			FileSystemId:   fsd.FileSystemId,
+			SecurityGroups: []*string{netInfo.sgID},
+			SubnetId:       sub,
+			// Mount Targets do not support tags directly
+		})
+		if err != nil {
+			return nil, fmt.Errorf("error creating mount target: %w", err)
+		}
+	}
+
+	// create EFS access points
+	s.Update("Creating EFS Access Point...")
+	uid := aws.Int64(int64(100))
+	gid := aws.Int64(int64(1000))
+	accessPoint, err := efsSvc.CreateAccessPoint(&efs.CreateAccessPointInput{
+		FileSystemId: fsd.FileSystemId,
+		PosixUser: &efs.PosixUser{
+			Uid: uid,
+			Gid: gid,
+		},
+		RootDirectory: &efs.RootDirectory{
+			CreationInfo: &efs.CreationInfo{
+				OwnerUid:    uid,
+				OwnerGid:    gid,
+				Permissions: aws.String("755"),
+			},
+			Path: aws.String("/waypointserverdata"),
+		},
+		Tags: []*efs.Tag{
+			{
+				Key:   aws.String(serverName),
+				Value: aws.String(ulid),
+			},
+		},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("error creating access point: %w", err)
+	}
+
+	// loop until all mount targets are ready, or the first container can have
+	// issues starting
+	s.Update("Waiting for EFS mount targets to become available...")
+	var available int
+	for i := 0; 1 < 30; i++ {
+		mtgs, err := efsSvc.DescribeMountTargets(&efs.DescribeMountTargetsInput{
+			AccessPointId: accessPoint.AccessPointId,
+		})
+		if err != nil {
+			return nil, err
+		}
+
+		for _, m := range mtgs.MountTargets {
+			if *m.LifeCycleState == efs.LifeCycleStateAvailable {
+				available++
+			}
+		}
+		if available == len(netInfo.subnets) {
+			break
+		}
+
+		available = 0
+		time.Sleep(5 * time.Second)
+		continue
+	}
+
+	if available != len(netInfo.subnets) {
+		return nil, fmt.Errorf("not enough available mount targets found")
+	}
+
+	return &efsInformation{
+		fileSystemID:  fsd.FileSystemId,
+		accessPointID: accessPoint.AccessPointId,
+	}, nil
 }
 
 type ecsServer struct {
@@ -1161,10 +1264,15 @@ type ecsServer struct {
 	Cluster            string
 }
 
-type networkInfo struct {
+type networkInformation struct {
 	vpcID   *string
 	sgID    *string
 	subnets []*string
+}
+
+type efsInformation struct {
+	fileSystemID  *string
+	accessPointID *string
 }
 
 type nlb struct {
@@ -1180,8 +1288,8 @@ func (i *ECSInstaller) Launch(
 	L hclog.Logger,
 	ui terminal.UI,
 	sess *session.Session,
-	efsId string,
-	netInfo *networkInfo,
+	efsInfo *efsInformation,
+	netInfo *networkInformation,
 	executionRoleArn, clusterName, logGroup, ulid string,
 ) (*ecsServer, error) {
 	s.Status("Installing Waypoint server into ECS...")
@@ -1249,106 +1357,6 @@ func (i *ECSInstaller) Launch(
 
 	// Create mount points for the EFS file system. The EFS mount targets need to
 	// existin in a 1:1 pair with the subnets in use.
-	s.Status("Creating EFS Mount targets...")
-	efsSvc := efs.New(sess)
-
-	L.Debug("polling for EFS", "FileSystemID", efsId)
-EFSLOOP:
-	for i := 0; i < 10; i++ {
-		fsList, err := efsSvc.DescribeFileSystems(&efs.DescribeFileSystemsInput{
-			FileSystemId: aws.String(efsId),
-		})
-		if err != nil {
-			return nil, err
-		}
-		if len(fsList.FileSystems) == 0 {
-			return nil, fmt.Errorf("file system (%s) not found", efsId)
-		}
-		// check the status of the first one
-		fs := fsList.FileSystems[0]
-		switch *fs.LifeCycleState {
-		case efs.LifeCycleStateDeleted, efs.LifeCycleStateDeleting:
-			return nil, fmt.Errorf("files system is deleting/deleted")
-		case efs.LifeCycleStateAvailable:
-			break EFSLOOP
-		}
-		time.Sleep(2 * time.Second)
-	}
-
-	// poll for available
-	for _, sub := range netInfo.subnets {
-		_, err := efsSvc.CreateMountTarget(&efs.CreateMountTargetInput{
-			FileSystemId:   aws.String(efsId),
-			SecurityGroups: []*string{netInfo.sgID},
-			SubnetId:       sub,
-			// Mount Targets do not support tags directly
-		})
-		if err != nil {
-			return nil, fmt.Errorf("error creating mount target: %w", err)
-		}
-	}
-
-	// create EFS access points
-	s.Update("Creating EFS Access Point...")
-	// TODO: move this to SetupEFS and share the access point returned
-	// these are the User and Group ids created in the Waypoint Server Dockerfile
-	uid := aws.Int64(int64(100))
-	gid := aws.Int64(int64(1000))
-	accessPoint, err := efsSvc.CreateAccessPoint(&efs.CreateAccessPointInput{
-		FileSystemId: aws.String(efsId),
-		PosixUser: &efs.PosixUser{
-			Uid: uid,
-			Gid: gid,
-		},
-		RootDirectory: &efs.RootDirectory{
-			CreationInfo: &efs.CreationInfo{
-				OwnerUid:    uid,
-				OwnerGid:    gid,
-				Permissions: aws.String("755"),
-			},
-			Path: aws.String("/waypointserverdata"),
-		},
-		Tags: []*efs.Tag{
-			{
-				Key:   aws.String(serverName),
-				Value: aws.String(ulid),
-			},
-		},
-	})
-	if err != nil {
-		return nil, fmt.Errorf("error creating access point: %w", err)
-	}
-	// loop until all mount targets are ready, or the first container can have
-	// issues starting
-
-	// create EFS access points
-	s.Update("Waiting for EFS mount targets to become available...")
-	var available int
-	for i := 0; 1 < 30; i++ {
-		mtgs, err := efsSvc.DescribeMountTargets(&efs.DescribeMountTargetsInput{
-			AccessPointId: accessPoint.AccessPointId,
-		})
-		if err != nil {
-			return nil, err
-		}
-
-		for _, m := range mtgs.MountTargets {
-			if *m.LifeCycleState == efs.LifeCycleStateAvailable {
-				available++
-			}
-		}
-		if available == len(netInfo.subnets) {
-			break
-		}
-
-		available = 0
-		time.Sleep(5 * time.Second)
-		continue
-	}
-
-	if available != len(netInfo.subnets) {
-		return nil, fmt.Errorf("not enough mount targets found")
-	}
 
 	time.Sleep(3 * time.Second)
 
@@ -1379,9 +1387,9 @@ EFSLOOP:
 				Name: aws.String("waypointdata"),
 				EfsVolumeConfiguration: &ecs.EFSVolumeConfiguration{
 					TransitEncryption: aws.String(ecs.EFSTransitEncryptionEnabled),
-					FileSystemId:      accessPoint.FileSystemId,
+					FileSystemId:      efsInfo.fileSystemID,
 					AuthorizationConfig: &ecs.EFSAuthorizationConfig{
-						AccessPointId: accessPoint.AccessPointId,
+						AccessPointId: efsInfo.accessPointID,
 					},
 				},
 			},
@@ -1748,6 +1756,20 @@ func (i *ECSInstaller) SetupExecutionRole(
 	s.Update("Created IAM role: %s", roleName)
 	return roleArn, nil
 }
+
+const rolePolicy = `{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+		  "Sid": "",
+      "Effect": "Allow",
+      "Principal": {
+        "Service": "ecs-tasks.amazonaws.com"
+      },
+      "Action": "sts:AssumeRole"
+    }
+  ]
+}`
 
 // creates a network load balancer for grpc and http
 func createNLB(

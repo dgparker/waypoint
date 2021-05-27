@@ -140,6 +140,7 @@ func (i *ECSInstaller) Install(
 	// Set our connection information
 	grpcAddr := fmt.Sprintf("%s:%s", server.Url, grpcPort)
 	httpAddr := fmt.Sprintf("%s:%s", server.Url, httpPort)
+	// Set our advertise address
 	advertiseAddr := pb.ServerConfig_AdvertiseAddr{
 		Addr:          grpcAddr,
 		Tls:           true,
@@ -929,14 +930,14 @@ func (l *lStatus) Close() error {
 	return nil
 }
 
-func (lf *Lifecycle) Execute(L hclog.Logger, ui terminal.UI) error {
+func (lf *Lifecycle) Execute(log hclog.Logger, ui terminal.UI) error {
 	var l lStatus
 	l.ui = ui
 
 	defer l.Close()
 
 	if lf.Init != nil {
-		L.Debug("lifecycle init")
+		log.Debug("lifecycle init")
 
 		err := lf.Init(&l)
 		if err != nil {
@@ -946,7 +947,7 @@ func (lf *Lifecycle) Execute(L hclog.Logger, ui terminal.UI) error {
 
 	}
 
-	L.Debug("lifecycle run")
+	log.Debug("lifecycle run")
 	err := lf.Run(&l)
 	if err != nil {
 		l.Abort()
@@ -954,7 +955,7 @@ func (lf *Lifecycle) Execute(L hclog.Logger, ui terminal.UI) error {
 	}
 
 	if lf.Cleanup != nil {
-		L.Debug("lifecycle cleanup")
+		log.Debug("lifecycle cleanup")
 
 		err = lf.Cleanup(&l)
 		if err != nil {
@@ -1216,7 +1217,7 @@ type nlb struct {
 func (i *ECSInstaller) Launch(
 	ctx context.Context,
 	s LifecycleStatus,
-	L hclog.Logger,
+	log hclog.Logger,
 	ui terminal.UI,
 	sess *session.Session,
 	efsInfo *efsInformation,
@@ -1275,7 +1276,7 @@ func (i *ECSInstaller) Launch(
 
 	s.Status("Creating Network resources...")
 	nlb, err := createNLB(
-		ctx, s, L, sess,
+		ctx, s, log, sess,
 		netInfo.vpcID,
 		aws.Int64(int64(grpcPort)),
 		netInfo.subnets,
@@ -1289,7 +1290,7 @@ func (i *ECSInstaller) Launch(
 	// Create mount points for the EFS file system. The EFS mount targets need to
 	// existin in a 1:1 pair with the subnets in use.
 	s.Status("Creating ECS Service and Tasks...")
-	L.Debug("registering task definition", "ulid", ulid)
+	log.Debug("registering task definition", "ulid", ulid)
 
 	cpus := aws.String(strconv.Itoa(defaultTaskCPU))
 	mems := strconv.Itoa(defaultTaskMemory)
@@ -1333,7 +1334,7 @@ func (i *ECSInstaller) Launch(
 
 	// Create the service
 	s.Update("Creating Service...")
-	L.Debug("creating service", "arn", *taskDef.TaskDefinitionArn)
+	log.Debug("creating service", "arn", *taskDef.TaskDefinitionArn)
 
 	createServiceInput := &ecs.CreateServiceInput{
 		Cluster:                       &clusterName,
@@ -1377,7 +1378,7 @@ func (i *ECSInstaller) Launch(
 	}
 
 	s.Update("Created ECS Service (%s, cluster-name: %s)", serviceName, clusterName)
-	L.Debug("service started", "arn", service.ServiceArn)
+	log.Debug("service started", "arn", service.ServiceArn)
 
 	// after the service is created with the specified target groups, the load
 	// balancer will start making health checks.
@@ -1507,7 +1508,7 @@ func createSG(
 func (i *ECSInstaller) SetupLogs(
 	ctx context.Context,
 	s LifecycleStatus,
-	L hclog.Logger,
+	log hclog.Logger,
 	sess *session.Session,
 	ulid string,
 	logGroup string,
@@ -1527,7 +1528,7 @@ func (i *ECSInstaller) SetupLogs(
 	if len(groups.LogGroups) == 0 {
 		s.Status("Creating CloudWatchLogs group to store logs in: %s", logGroup)
 
-		L.Debug("creating log group", "group", logGroup)
+		log.Debug("creating log group", "group", logGroup)
 		_, err = cwl.CreateLogGroup(&cloudwatchlogs.CreateLogGroupInput{
 			LogGroupName: aws.String(logGroup),
 		})
@@ -1592,7 +1593,7 @@ type Logging struct {
 func (i *ECSInstaller) SetupExecutionRole(
 	ctx context.Context,
 	s LifecycleStatus,
-	L hclog.Logger,
+	log hclog.Logger,
 	sess *session.Session,
 	ulid string,
 ) (string, error) {
@@ -1604,10 +1605,10 @@ func (i *ECSInstaller) SetupExecutionRole(
 	// validate this.
 	if len(roleName) > 64 {
 		roleName = roleName[:64]
-		L.Debug("using a shortened value for role name due to AWS's length limits", "roleName", roleName)
+		log.Debug("using a shortened value for role name due to AWS's length limits", "roleName", roleName)
 	}
 
-	L.Debug("attempting to retrieve existing role", "role-name", roleName)
+	log.Debug("attempting to retrieve existing role", "role-name", roleName)
 
 	queryInput := &iam.GetRoleInput{
 		RoleName: aws.String(roleName),
@@ -1619,7 +1620,7 @@ func (i *ECSInstaller) SetupExecutionRole(
 		return *getOut.Role.Arn, nil
 	}
 
-	L.Debug("creating new role")
+	log.Debug("creating new role")
 	s.Status("Creating IAM role: %s", roleName)
 
 	input := &iam.CreateRoleInput{
@@ -1641,7 +1642,7 @@ func (i *ECSInstaller) SetupExecutionRole(
 
 	roleArn := *result.Role.Arn
 
-	L.Debug("created new role", "arn", roleArn)
+	log.Debug("created new role", "arn", roleArn)
 
 	aInput := &iam.AttachRolePolicyInput{
 		RoleName:  aws.String(roleName),
@@ -1653,7 +1654,7 @@ func (i *ECSInstaller) SetupExecutionRole(
 		return "", err
 	}
 
-	L.Debug("attached execution role policy")
+	log.Debug("attached execution role policy")
 
 	s.Update("Created IAM role: %s", roleName)
 	return roleArn, nil
@@ -1677,7 +1678,7 @@ const rolePolicy = `{
 func createNLB(
 	ctx context.Context,
 	s LifecycleStatus,
-	L hclog.Logger,
+	log hclog.Logger,
 	sess *session.Session,
 	vpcId *string,
 	grpcPort *int64,
@@ -1823,7 +1824,7 @@ func createNLB(
 
 	s.Update("Creating new NLB Listener")
 
-	L.Info("load-balancer defined", "dns-name", *lb.DNSName)
+	log.Info("load-balancer defined", "dns-name", *lb.DNSName)
 
 	_, err = elbsrv.CreateListener(&elbv2.CreateListenerInput{
 		LoadBalancerArn: lb.LoadBalancerArn,
@@ -1953,8 +1954,7 @@ func registerTaskDefinition(def *ecs.RegisterTaskDefinitionInput, ecsSvc *ecs.EC
 
 		// if we encounter an unrecoverable error, exit now.
 		if aerr, ok := err.(awserr.Error); ok {
-			switch aerr.Code() {
-			case "ResourceConflictException":
+			if aerr.Code() == "ResourceConflictException" {
 				return nil, err
 			}
 		}
@@ -1968,7 +1968,7 @@ func registerTaskDefinition(def *ecs.RegisterTaskDefinitionInput, ecsSvc *ecs.EC
 func (i *ECSInstaller) LaunchRunner(
 	ctx context.Context,
 	s LifecycleStatus,
-	L hclog.Logger,
+	log hclog.Logger,
 	ui terminal.UI,
 	sess *session.Session,
 	env []string,
@@ -2058,7 +2058,7 @@ func (i *ECSInstaller) LaunchRunner(
 
 	taskDefArn := *taskDef.TaskDefinitionArn
 	s.Status("Creating Service...")
-	L.Debug("creating service", "arn", *taskDef.TaskDefinitionArn)
+	log.Debug("creating service", "arn", *taskDef.TaskDefinitionArn)
 
 	// find the default security group to use
 	ec2srv := ec2.New(sess)

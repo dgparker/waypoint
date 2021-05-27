@@ -1,7 +1,10 @@
 import { Factory, trait, association } from 'ember-cli-mirage';
-import { fakeId, sequenceRandom } from '../utils';
+import { fakeId } from '../utils';
 
 export default Factory.extend({
+  id: () => fakeId(),
+  sequence: (i) => i + 1,
+
   afterCreate(release, server) {
     if (!release.workspace) {
       let workspace =
@@ -11,9 +14,7 @@ export default Factory.extend({
   },
 
   random: trait({
-    id: () => fakeId(),
     component: association('release-manager', 'with-random-name'),
-    sequence: () => sequenceRandom(),
     status: association('random'),
     state: 'CREATED',
     labels: () => ({

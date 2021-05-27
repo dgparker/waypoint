@@ -2,6 +2,9 @@ import { Factory, trait, association } from 'ember-cli-mirage';
 import { fakeId } from '../utils';
 
 export default Factory.extend({
+  id: () => fakeId(),
+  sequence: (i) => i + 1,
+
   afterCreate(build, server) {
     if (!build.workspace) {
       let workspace =
@@ -11,8 +14,6 @@ export default Factory.extend({
   },
 
   random: trait({
-    id: () => fakeId(),
-    sequence: (i) => i + 1,
     labels: () => ({
       'common/vcs-ref': '0d56a9f8456b088dd0e4a7b689b842876fd47352',
       'common/vcs-ref-path': 'https://github.com/hashicorp/waypoint/commit/',

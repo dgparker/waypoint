@@ -112,6 +112,18 @@ export default class ApiService extends Service {
 
     return resp.getStatusReportsList().map((d) => d.toObject());
   }
+
+  async getLatestStatusReport(wsRef: Ref.Workspace, appRef: Ref.Application): Promise<StatusReport|undefined>{
+    let req = new GetLatestStatusReportRequest();
+    req.setApplication(appRef);
+    // We have to try/catch to avoid failing the hash request because the api errors if no statusReport is available
+    try {
+      let resp: StatusReport = await this.client.getLatestStatusReport(req, this.WithMeta());
+      return resp.toObject();
+    } catch {
+      return;
+    }
+  }
 }
 
 // DO NOT DELETE: this is how TypeScript knows how to look up your services.

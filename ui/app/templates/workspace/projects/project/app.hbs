@@ -19,8 +19,9 @@
     </small>
   </div>
   <div class="actions">
-    {{!-- TODO: Data --}}
-    <StatusBadge @state={{@model.status.state}}/>
+    {{#if @model.statusReports.length}}
+      <StatusBadge @state={{@model.latestStatusReport.status.state}}/>
+    {{/if}}
     {{#if @model.releases.length}}
     <LatestReleaseUrl @releases={{@model.releases}}></LatestReleaseUrl>
     {{else}}

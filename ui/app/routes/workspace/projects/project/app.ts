@@ -1,7 +1,7 @@
 import Route from '@ember/routing/route';
 import { inject as service } from '@ember/service';
 import ApiService from 'waypoint/services/api';
-import { Ref, Deployment, Build, Release, Project } from 'waypoint-pb';
+import { Ref, Deployment, Build, Release, Project, StatusReport } from 'waypoint-pb';
 import PollModelService from 'waypoint/services/poll-model';
 import ObjectProxy from '@ember/object/proxy';
 import PromiseProxyMixin from '@ember/object/promise-proxy-mixin';
@@ -16,6 +16,7 @@ export interface AppRouteModel {
   deployments: Promise<Deployment.AsObject[]>;
   releases: Promise<Release.AsObject[]>;
   builds: Promise<Build.AsObject[]>;
+  statusReports: Promise<StatusReport.AsObject[]>;
 }
 
 export default class App extends Route {
@@ -60,6 +61,9 @@ export default class App extends Route {
       }),
       statusReports: ObjectPromiseProxy.create({
         promise: resolve(this.api.listStatusReports(wsRef, appRef)),
+      }),
+      latestStatusReport: ObjectPromiseProxy.create({
+        promise: resolve(this.api.getLatestStatusReport(wsRef, appRef)),
       }),
     });
   }

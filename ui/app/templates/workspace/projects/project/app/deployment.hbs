@@ -20,7 +20,8 @@
 
 <div class="item-row">
   <div class="item">
-    {{#if (eq @model.status.state 1)}}
+    <StatusBadge @state={{@model.status.state}}/>
+    {{!-- {{#if (eq @model.status.state 1)}}
     <b class="badge">{{t 'state.deployment.pending'}}</b>
     {{else if (eq @model.status.state 2)}}
     <b class="badge badge--success">{{t 'state.deployment.success'}}</b>
@@ -31,7 +32,7 @@
         : {{@model.status.error.message}}
       {{/if}}
     </b>
-    {{/if}}
+    {{/if}} --}}
   </div>
 
   {{#if @model.build}}

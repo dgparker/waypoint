@@ -30,7 +30,7 @@ export default Model.extend({
     result.setState(PhysicalState[this.state as StateName]);
     result.setStatus(this.status?.toProtobuf());
     result.setTemplateData(this.templateData);
-    result.setWorkspace(this.workspace.toProtobufRef());
+    result.setWorkspace(this.workspace?.toProtobufRef());
 
     for (let [key, value] of Object.entries<string>(this.labels ?? {})) {
       result.getLabelsMap().set(key, value);

@@ -5,7 +5,7 @@
 <ul data-test-deployment-list=true class="list">
   {{#each this.deploymentsByGeneration key="generationID" as |group|}}
     {{#each group.deployments key="id" as |deployment|}}
-      <AppItem::Deployment @deployment={{deployment}} />
+      <AppItem::Deployment @deployment={{deployment}} @latest={{group.deployments.[0]}} />
     {{/each}}
   {{else}}
     <EmptyState>

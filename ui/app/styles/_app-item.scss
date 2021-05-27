@@ -64,4 +64,22 @@
       text-overflow: ellipsis;
     }
   }
+
+  .replacement-info {
+    b {
+      text-transform: inherit;
+      margin-left: scale.$sm-2;
+    }
+  }
+
+  &--previous {
+    background: #F7FAFC;
+    background-clip: border-box;
+    margin-bottom: 0px;
+    border-top: 1rem solid #F7FAFC;
+  }
+
+  &--latest {
+    margin-top: 1rem;
+  }
 }

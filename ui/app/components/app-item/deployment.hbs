@@ -1,4 +1,4 @@
-<li class={{if (eq @deployment.state 4) "app-item app-item--destroyed" "app-item"}}>
+<li class="{{if (eq @deployment.sequence @latest.sequence) "app-item--latest" "app-item--previous"}} {{if (eq @deployment.state 4) "app-item app-item--destroyed" "app-item"}}">
   <LinkTo @route="workspace.projects.project.app.deployment" @models={{array @deployment.id}}>
     <p>
       <b class="badge badge--version">v{{@deployment.sequence}}</b>
@@ -21,9 +21,14 @@
       </span>
     </small>
   </LinkTo>
-  {{#if (and @deployment.preload.deployUrl (not-eq @deployment.state 4))}}
+  {{#if (not-eq @latest.id @deployment.id)}}
+  <small class="replacement-info">
+    Replaced by <b class="badge badge--version">v{{@latest.sequence}}</b>
+    {{log @latest}}
+  </small>
+  {{else if (and @deployment.preload.deployUrl (not-eq @deployment.state 4))}}
     <ExternalLink href="https://{{@deployment.preload.deployUrl}}" class="button button--secondary button--external-link">
-      <span>{{lowercase @deployment.preload.deployUrl}}</span>
+      <span>Visit Deployment</span>
       <Pds::Icon @type="exit" class="icon" />
     </ExternalLink>
   {{/if}}

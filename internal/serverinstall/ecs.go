@@ -3,7 +3,6 @@ package serverinstall
 import (
 	"context"
 	"fmt"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -30,11 +29,15 @@ import (
 )
 
 const (
-	defaultServerLogGroup = "waypoint-server-logs"
 	defaultRunnerLogGroup = "waypoint-runner-logs"
-	defaultTaskCPU        = 512
-	defaultTaskMemory     = 1024
-	defaultRuntime        = "FARGATE"
+	defaultServerLogGroup = "waypoint-server-logs"
+
+	defaultTaskCPU     = 512
+	defaultTaskMemory  = 1024
+	defaultTaskFamily  = "waypoint-server"
+	defaultTaskRuntime = "FARGATE"
+
+	defaultSecurityGroupName = "waypoint-server-security-group"
 )
 
 var ulid string
@@ -50,10 +53,6 @@ type ecsConfig struct {
 
 	// Name of the ECS cluster to install the service into
 	cluster string `hcl:"cluster,optional"`
-
-	// Port that your service is running on within the actual container.
-	// Defaults to port 3000.
-	servicePort int64 `hcl:"service_port,optional"`
 
 	// Name of the execution task IAM Role to associate with the ECS Service
 	executionRoleName string `hcl:"execution_role_name,optional"`
@@ -74,7 +73,7 @@ func (i *ECSInstaller) Install(
 	sg := ui.StepGroup()
 	defer sg.Wait()
 
-	s := sg.Add("Inspecting existing ECS clusters...")
+	s := sg.Add("Installing Waypoint server")
 	defer func() { s.Abort() }()
 	log.Info("Starting lifecycle")
 
@@ -83,12 +82,14 @@ func (i *ECSInstaller) Install(
 
 		executionRole, cluster, serverLogGroup, efsId string
 
+		netInfo *networkInfo
+
 		dep *ecsServer
 
 		err error
 	)
-	q.Q("-> ulid in install:", ulid)
 
+	// TODO - debugging
 	start := time.Now()
 	defer func() {
 		q.Q("->Total time:", time.Since(start).Minutes())
@@ -103,6 +104,11 @@ func (i *ECSInstaller) Install(
 			if err != nil {
 				return err
 			}
+			netInfo, err = i.SetupNetworking(ctx, s, sess, ulid)
+			if err != nil {
+				return err
+			}
+
 			cluster, err = i.SetupCluster(ctx, s, sess, ulid)
 			if err != nil {
 				return err
@@ -127,7 +133,7 @@ func (i *ECSInstaller) Install(
 		},
 
 		Run: func(s LifecycleStatus) error {
-			dep, err = i.Launch(ctx, s, log, ui, sess, efsId, executionRole, cluster, serverLogGroup, ulid)
+			dep, err = i.Launch(ctx, s, log, ui, sess, efsId, netInfo, executionRole, cluster, serverLogGroup, ulid)
 			return err
 		},
 
@@ -270,7 +276,7 @@ func (i *ECSInstaller) Upgrade(
 			Family:                  taskDef.Family,
 			Memory:                  taskDef.Memory,
 			NetworkMode:             aws.String("awsvpc"),
-			RequiresCompatibilities: []*string{aws.String(defaultRuntime)},
+			RequiresCompatibilities: []*string{aws.String(defaultTaskRuntime)},
 			Tags:                    taskTags,
 			Volumes:                 taskDef.Volumes,
 		}
@@ -350,7 +356,7 @@ func (i *ECSInstaller) Uninstall(
 	if err != nil {
 		return err
 	}
-	q.Q("=> resources len:", len(results.ResourceIdentifiers))
+
 	resources := results.ResourceIdentifiers
 
 	// Start destroying things. Some cannot be destroyed before others. The
@@ -584,7 +590,7 @@ func deleteEcsResources(
 		Cluster: &clusterArn,
 	})
 	if err != nil {
-		q.Q("-> -> describe services err:", err)
+		return err
 	}
 
 	for _, service := range results.ServiceArns {
@@ -820,7 +826,7 @@ func (i *ECSInstaller) UninstallRunner(
 	if err != nil {
 		return err
 	}
-	q.Q("=> resources len:", len(results.ResourceIdentifiers))
+
 	resources := results.ResourceIdentifiers
 	s.Status("Deleting ECS resources...")
 	if err := deleteRunnerResources(ctx, s, sess, resources); err != nil {
@@ -1011,6 +1017,40 @@ type LifecycleStatus interface {
 	Error(str string, args ...interface{})
 }
 
+func (i *ECSInstaller) SetupNetworking(
+	ctx context.Context,
+	s LifecycleStatus,
+	sess *session.Session,
+	ulid string,
+) (*networkInfo, error) {
+
+	s.Status("Establishing subnets and security group...")
+	subnets, vpcID, err := i.subnetInfo(ctx, s, sess)
+	if err != nil {
+		return nil, err
+	}
+
+	s.Status("Setting up security group...")
+	grpcPort, _ := strconv.Atoi(defaultGrpcPort)
+	httpPort, _ := strconv.Atoi(defaultHttpPort)
+	ports := []*int64{
+		aws.Int64(int64(grpcPort)),
+		aws.Int64(int64(httpPort)),
+		aws.Int64(int64(2049)), // EFS File system port
+		aws.Int64(int64(80)),   // web - TODO check thsi
+	}
+
+	sgID, err := createSG(ctx, s, sess, defaultSecurityGroupName, vpcID, ulid, ports)
+	if err != nil {
+		return nil, err
+	}
+	return &networkInfo{
+		vpcID:   vpcID,
+		subnets: subnets,
+		sgID:    sgID,
+	}, nil
+}
+
 func (i *ECSInstaller) SetupCluster(
 	ctx context.Context,
 	s LifecycleStatus,
@@ -1019,6 +1059,7 @@ func (i *ECSInstaller) SetupCluster(
 ) (string, error) {
 	ecsSvc := ecs.New(sess)
 
+	s.Status("Inspecting existing ECS clusters...")
 	cluster := i.config.cluster
 
 	// re-use an existing cluster if we have one
@@ -1104,27 +1145,7 @@ const rolePolicy = `{
   ]
 }`
 
-var fargateResources = map[int][]int{
-	512:  {256},
-	1024: {256, 512},
-	2048: {256, 512, 1024},
-	3072: {512, 1024},
-	4096: {512, 1024},
-	5120: {1024},
-	6144: {1024},
-	7168: {1024},
-	8192: {1024},
-}
-
 func init() {
-	for i := 4096; i < 16384; i += 1024 {
-		fargateResources[i] = append(fargateResources[i], 2048)
-	}
-
-	for i := 8192; i <= 30720; i += 1024 {
-		fargateResources[i] = append(fargateResources[i], 4096)
-	}
-
 	// generate a ULID for use in FileSystem creation and unique tag value for
 	// this installation
 	ulid, _ = component.Id()
@@ -1138,6 +1159,12 @@ type ecsServer struct {
 	GRPCTargetGroupArn string
 	LoadBalancerArn    string
 	Cluster            string
+}
+
+type networkInfo struct {
+	vpcID   *string
+	sgID    *string
+	subnets []*string
 }
 
 type nlb struct {
@@ -1154,40 +1181,12 @@ func (i *ECSInstaller) Launch(
 	ui terminal.UI,
 	sess *session.Session,
 	efsId string,
+	netInfo *networkInfo,
 	executionRoleArn, clusterName, logGroup, ulid string,
 ) (*ecsServer, error) {
 	s.Status("Installing Waypoint server into ECS...")
 
 	ecsSvc := ecs.New(sess)
-
-	env := []*ecs.KeyValuePair{
-		{
-			Name:  aws.String("PORT"),
-			Value: aws.String(fmt.Sprint(httpPort)),
-		},
-	}
-
-	// for k, v := range i.config.Environment {
-	// 	env = append(env, &ecs.KeyValuePair{
-	// 		Name:  aws.String(k),
-	// 		Value: aws.String(v),
-	// 	})
-	// }
-
-	// var secrets []*ecs.Secret
-	// for k, v := range i.config.Secrets {
-	// 	secrets = append(secrets, &ecs.Secret{
-	// 		Name:      aws.String(k),
-	// 		ValueFrom: aws.String(v),
-	// 	})
-	// }
-
-	// for k, v := range deployConfig.Env() {
-	// 	env = append(env, &ecs.KeyValuePair{
-	// 		Name:  aws.String(k),
-	// 		Value: aws.String(v),
-	// 	})
-	// }
 
 	defaultStreamPrefix := fmt.Sprintf("waypoint-server-%d", time.Now().Nanosecond())
 	logOptions := buildLoggingOptions(
@@ -1196,10 +1195,6 @@ func (i *ECSInstaller) Launch(
 		logGroup,
 		defaultStreamPrefix,
 	)
-
-	// TODO convert these from config
-	cpu := defaultTaskCPU
-	mem := defaultTaskMemory
 
 	grpcPort, _ := strconv.Atoi(defaultGrpcPort)
 	httpPort, _ := strconv.Atoi(defaultHttpPort)
@@ -1217,80 +1212,34 @@ func (i *ECSInstaller) Launch(
 	def := ecs.ContainerDefinition{
 		Essential: aws.Bool(true),
 		Command:   cmd,
-		Name:      aws.String("waypoint-server"),
+		Name:      aws.String(serverName),
 		Image:     aws.String(i.config.serverImage),
 		PortMappings: []*ecs.PortMapping{
 			{
-				// TODO: configurable port
 				ContainerPort: aws.Int64(int64(httpPort)),
 			},
 			{
-				// TODO: configurable port
 				ContainerPort: aws.Int64(int64(grpcPort)),
 			},
 		},
-		Environment: env,
-		// TODO: These are optional for Fargate
-		Memory: utils.OptionalInt64(int64(mem)),
 		LogConfiguration: &ecs.LogConfiguration{
-			LogDriver: aws.String("awslogs"),
+			LogDriver: aws.String(ecs.LogDriverAwslogs),
 			Options:   logOptions,
 		},
-		// TODO: configure this
 		MountPoints: []*ecs.MountPoint{
 			{
-				SourceVolume:  aws.String("myefs"),
+				SourceVolume:  aws.String("waypointdata"),
 				ContainerPath: aws.String("/waypoint-data"),
-				ReadOnly:      aws.Bool(false),
 			},
 		},
-	}
-
-	s.Status("Setting up networking resources...")
-	var (
-		err     error
-		subnets []*string
-	)
-
-	if len(i.config.subnets) == 0 {
-		s.Update("Using default subnets for Service networking")
-		subnets, err = defaultSubnets(ctx, sess)
-		if err != nil {
-			return nil, err
-		}
-	} else {
-		subnets = make([]*string, len(i.config.subnets))
-		for j := range i.config.subnets {
-			subnets[j] = &i.config.subnets[j]
-		}
-		s.Update("Using provided subnets for Service networking")
-	}
-
-	ec2srv := ec2.New(sess)
-
-	subnetInfo, err := ec2srv.DescribeSubnets(&ec2.DescribeSubnetsInput{
-		SubnetIds: subnets,
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	vpcId := subnetInfo.Subnets[0].VpcId
-	q.Q("-> vpcId:", vpcId)
-
-	sgName := "waypoint-server-inbound"
-	s.Status("Setting up security group...")
-	sgecsport, err := createSG(ctx, s, sess, sgName, vpcId, ulid, httpPort, grpcPort)
-	if err != nil {
-		return nil, err
 	}
 
 	s.Status("Creating Network resources...")
 	nlb, err := createNLB(
 		ctx, s, L, sess,
-		vpcId,
+		netInfo.vpcID,
 		aws.Int64(int64(grpcPort)),
-		subnets,
+		netInfo.subnets,
 		ulid,
 	)
 	if err != nil {
@@ -1304,7 +1253,6 @@ func (i *ECSInstaller) Launch(
 	efsSvc := efs.New(sess)
 
 	L.Debug("polling for EFS", "FileSystemID", efsId)
-
 EFSLOOP:
 	for i := 0; i < 10; i++ {
 		fsList, err := efsSvc.DescribeFileSystems(&efs.DescribeFileSystemsInput{
@@ -1324,14 +1272,14 @@ EFSLOOP:
 		case efs.LifeCycleStateAvailable:
 			break EFSLOOP
 		}
-		time.Sleep(1 * time.Second)
+		time.Sleep(2 * time.Second)
 	}
 
 	// poll for available
-	for _, sub := range subnets {
+	for _, sub := range netInfo.subnets {
 		_, err := efsSvc.CreateMountTarget(&efs.CreateMountTargetInput{
 			FileSystemId:   aws.String(efsId),
-			SecurityGroups: []*string{sgecsport},
+			SecurityGroups: []*string{netInfo.sgID},
 			SubnetId:       sub,
 			// Mount Targets do not support tags directly
 		})
@@ -1389,7 +1337,7 @@ EFSLOOP:
 				available++
 			}
 		}
-		if available == len(subnets) {
+		if available == len(netInfo.subnets) {
 			break
 		}
 
@@ -1398,7 +1346,7 @@ EFSLOOP:
 		continue
 	}
 
-	if available != len(subnets) {
+	if available != len(netInfo.subnets) {
 		return nil, fmt.Errorf("not enough mount targets found")
 	}
 
@@ -1407,87 +1355,28 @@ EFSLOOP:
 	s.Status("Creating ECS Service and Tasks...")
 	L.Debug("registering task definition", "ulid", ulid)
 
-	var cpuShares int
+	cpus := aws.String(strconv.Itoa(defaultTaskCPU))
+	mems := strconv.Itoa(defaultTaskMemory)
 
-	if mem == 0 {
-		return nil, fmt.Errorf("Memory value required for fargate")
-	}
-	cpuValues, ok := fargateResources[mem]
-	if !ok {
-		var (
-			allValues  []int
-			goodValues []string
-		)
-
-		for k := range fargateResources {
-			allValues = append(allValues, k)
-		}
-
-		sort.Ints(allValues)
-
-		for _, k := range allValues {
-			goodValues = append(goodValues, strconv.Itoa(k))
-		}
-
-		return nil, fmt.Errorf("Invalid memory value: %d (valid values: %s)",
-			mem, strings.Join(goodValues, ", "))
-	}
-
-	if cpu == 0 {
-		cpuShares = cpuValues[0]
-	} else {
-		var (
-			valid      bool
-			goodValues []string
-		)
-
-		for _, c := range cpuValues {
-			goodValues = append(goodValues, strconv.Itoa(c))
-			if c == cpu {
-				valid = true
-				break
-			}
-		}
-
-		if !valid {
-			return nil, fmt.Errorf("Invalid cpu value: %d (valid values: %s)",
-				mem, strings.Join(goodValues, ", "))
-		}
-
-		cpuShares = cpu
-	}
-
-	// TODO default cpu/mem
-	cpus := aws.String(strconv.Itoa(cpuShares))
-	mems := strconv.Itoa(mem)
-
-	// TODO config family
-	family := "waypoint-server"
-
-	s.Update("Registering Task definition: %s", family)
-
-	containerDefinitions := []*ecs.ContainerDefinition{&def}
+	s.Update("Registering Task definition: %s", defaultTaskFamily)
 
 	registerTaskDefinitionInput := ecs.RegisterTaskDefinitionInput{
-		ContainerDefinitions: containerDefinitions,
-
-		ExecutionRoleArn: aws.String(executionRoleArn),
-		Cpu:              cpus,
-		Memory:           aws.String(mems),
-		Family:           aws.String(family),
-
+		ContainerDefinitions:    []*ecs.ContainerDefinition{&def},
+		ExecutionRoleArn:        aws.String(executionRoleArn),
+		Cpu:                     cpus,
+		Memory:                  aws.String(mems),
+		Family:                  aws.String(defaultTaskFamily),
 		NetworkMode:             aws.String("awsvpc"),
-		RequiresCompatibilities: []*string{aws.String(defaultRuntime)},
+		RequiresCompatibilities: []*string{aws.String(defaultTaskRuntime)},
 		Tags: []*ecs.Tag{
 			{
 				Key:   aws.String(serverName),
 				Value: aws.String(ulid),
 			},
 		},
-		// TODO: configurable / create EFS
 		Volumes: []*ecs.Volume{
 			{
-				Name: aws.String("myefs"),
+				Name: aws.String("waypointdata"),
 				EfsVolumeConfiguration: &ecs.EFSVolumeConfiguration{
 					TransitEncryption: aws.String(ecs.EFSTransitEncryptionEnabled),
 					FileSystemId:      accessPoint.FileSystemId,
@@ -1504,17 +1393,6 @@ EFSLOOP:
 		return nil, err
 	}
 
-	// TODO: check service name
-	// serviceName := fmt.Sprintf("%s-%s", "waypoint-server", id)
-	serviceName := "waypoint-server"
-
-	// We have to clamp at a length of 32 because the Name field to CreateTargetGroup
-	// requires that the name is 32 characters or less.
-	if len(serviceName) > 27 {
-		serviceName = serviceName[:27]
-		L.Debug("using a shortened value for service name due to AWS's length limits", "serviceName", serviceName)
-	}
-
 	taskDefArn := *taskDef.TaskDefinitionArn
 
 	// Create the service
@@ -1524,14 +1402,14 @@ EFSLOOP:
 	createServiceInput := &ecs.CreateServiceInput{
 		Cluster:                       &clusterName,
 		DesiredCount:                  aws.Int64(1),
-		LaunchType:                    aws.String(defaultRuntime),
-		ServiceName:                   aws.String(serviceName),
+		LaunchType:                    aws.String(defaultTaskRuntime),
+		ServiceName:                   aws.String(serverName),
 		TaskDefinition:                aws.String(taskDefArn),
 		HealthCheckGracePeriodSeconds: aws.Int64(int64(600)),
 		NetworkConfiguration: &ecs.NetworkConfiguration{
 			AwsvpcConfiguration: &ecs.AwsVpcConfiguration{
-				Subnets:        subnets,
-				SecurityGroups: []*string{sgecsport},
+				Subnets:        netInfo.subnets,
+				SecurityGroups: []*string{netInfo.sgID},
 				AssignPublicIp: aws.String("ENABLED"),
 			},
 		},
@@ -1606,7 +1484,6 @@ EFSLOOP:
 			TargetGroupArn: &nlb.httpTgArn,
 		})
 		if err != nil {
-			q.Q("-> describe health response:", err)
 			return nil, err
 		}
 		if len(health.TargetHealthDescriptions) == 0 {
@@ -1638,7 +1515,7 @@ func createSG(
 	name string,
 	vpcId *string,
 	ulid string,
-	ports ...int,
+	ports []*int64,
 ) (*string, error) {
 	ec2srv := ec2.New(sess)
 
@@ -1691,12 +1568,11 @@ func createSG(
 
 	s.Update("Authorizing ports to security group")
 	// Port 2049 is the port for accessing EFS file systems over NFS
-	ports = append(ports, 2049, 80)
 	for _, port := range ports {
 		_, err = ec2srv.AuthorizeSecurityGroupIngress(&ec2.AuthorizeSecurityGroupIngressInput{
 			CidrIp:     aws.String("0.0.0.0/0"),
-			FromPort:   aws.Int64(int64(port)),
-			ToPort:     aws.Int64(int64(port)),
+			FromPort:   port,
+			ToPort:     port,
 			GroupId:    groupId,
 			IpProtocol: aws.String("tcp"),
 		})
@@ -2081,28 +1957,61 @@ func createNLB(
 	}, nil
 }
 
-func defaultSubnets(ctx context.Context, sess *session.Session) ([]*string, error) {
-	svc := ec2.New(sess)
+func (i *ECSInstaller) subnetInfo(
+	ctx context.Context,
+	s LifecycleStatus,
+	sess *session.Session,
+) ([]*string, *string, error) {
+	ec2Svc := ec2.New(sess)
 
-	desc, err := svc.DescribeSubnets(&ec2.DescribeSubnetsInput{
-		Filters: []*ec2.Filter{
-			{
-				Name:   aws.String("default-for-az"),
-				Values: []*string{aws.String("true")},
+	var (
+		subnets []*string
+		vpcID   *string
+	)
+
+	if len(i.config.subnets) == 0 {
+		s.Update("Using default subnets for Service networking")
+		desc, err := ec2Svc.DescribeSubnets(&ec2.DescribeSubnetsInput{
+			Filters: []*ec2.Filter{
+				{
+					Name:   aws.String("default-for-az"),
+					Values: []*string{aws.String("true")},
+				},
 			},
-		},
+		})
+		if err != nil {
+			return nil, nil, err
+		}
+
+		for _, subnet := range desc.Subnets {
+			subnets = append(subnets, subnet.SubnetId)
+		}
+		if len(desc.Subnets) == 0 {
+			return nil, nil, fmt.Errorf("no default subnet information found")
+		}
+		vpcID = desc.Subnets[0].VpcId
+		return subnets, vpcID, nil
+	}
+
+	subnets = make([]*string, len(i.config.subnets))
+	for j := range i.config.subnets {
+		subnets[j] = &i.config.subnets[j]
+	}
+	s.Update("Using provided subnets for Service networking")
+	subnetInfo, err := ec2Svc.DescribeSubnets(&ec2.DescribeSubnetsInput{
+		SubnetIds: subnets,
 	})
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
-	var subnets []*string
-
-	for _, subnet := range desc.Subnets {
-		subnets = append(subnets, subnet.SubnetId)
+	if len(subnetInfo.Subnets) == 0 {
+		return nil, nil, fmt.Errorf("no subnet information found for provided subnets")
 	}
 
-	return subnets, nil
+	vpcID = subnetInfo.Subnets[0].VpcId
+
+	return subnets, vpcID, nil
 }
 
 func registerTaskDefinition(def *ecs.RegisterTaskDefinitionInput, ecsSvc *ecs.ECS) (*ecs.TaskDefinition, error) {
@@ -2189,7 +2098,7 @@ func (i *ECSInstaller) LaunchRunner(
 		},
 		Environment: envs,
 		LogConfiguration: &ecs.LogConfiguration{
-			LogDriver: aws.String("awslogs"),
+			LogDriver: aws.String(ecs.LogDriverAwslogs),
 			Options:   logOptions,
 		},
 	}
@@ -2199,9 +2108,8 @@ func (i *ECSInstaller) LaunchRunner(
 
 	s.Update("Registering Task definition: waypoint-runner")
 
-	containerDefinitions := []*ecs.ContainerDefinition{&def}
 	registerTaskDefinitionInput := ecs.RegisterTaskDefinitionInput{
-		ContainerDefinitions: containerDefinitions,
+		ContainerDefinitions: []*ecs.ContainerDefinition{&def},
 
 		ExecutionRoleArn: aws.String(executionRoleArn),
 		Cpu:              cpus,
@@ -2209,7 +2117,7 @@ func (i *ECSInstaller) LaunchRunner(
 		Family:           aws.String("waypoint-runner"),
 
 		NetworkMode:             aws.String("awsvpc"),
-		RequiresCompatibilities: []*string{aws.String(defaultRuntime)},
+		RequiresCompatibilities: []*string{aws.String(defaultTaskRuntime)},
 		Tags: []*ecs.Tag{
 			{
 				Key:   aws.String(runnerName),
@@ -2230,12 +2138,11 @@ func (i *ECSInstaller) LaunchRunner(
 
 	// find the default security group to use
 	ec2srv := ec2.New(sess)
-	sgName := "waypoint-server-inbound"
 	dsg, err := ec2srv.DescribeSecurityGroups(&ec2.DescribeSecurityGroupsInput{
 		Filters: []*ec2.Filter{
 			{
 				Name:   aws.String("group-name"),
-				Values: []*string{&sgName},
+				Values: []*string{aws.String(defaultSecurityGroupName)},
 			},
 		},
 	})
@@ -2246,9 +2153,9 @@ func (i *ECSInstaller) LaunchRunner(
 	var groupId *string
 	if len(dsg.SecurityGroups) != 0 {
 		groupId = dsg.SecurityGroups[0].GroupId
-		s.Update("Using existing security group: %s", sgName)
+		s.Update("Using existing security group: %s", defaultSecurityGroupName)
 	} else {
-		return nil, fmt.Errorf("could not find waypoint-server-inbound security group")
+		return nil, fmt.Errorf("could not find security group (%s)", defaultSecurityGroupName)
 	}
 
 	// query what subnets and vpc information from the server service
@@ -2272,7 +2179,7 @@ func (i *ECSInstaller) LaunchRunner(
 	createServiceInput := &ecs.CreateServiceInput{
 		Cluster:        clusterArn,
 		DesiredCount:   aws.Int64(1),
-		LaunchType:     aws.String(defaultRuntime),
+		LaunchType:     aws.String(defaultTaskRuntime),
 		ServiceName:    aws.String(runnerName),
 		TaskDefinition: aws.String(taskDefArn),
 		NetworkConfiguration: &ecs.NetworkConfiguration{

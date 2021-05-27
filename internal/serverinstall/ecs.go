@@ -83,15 +83,11 @@ func (i *ECSInstaller) Install(
 	log.Info("Starting lifecycle")
 
 	var (
-		sess *session.Session
-
+		efsInfo                                *efsInformation
 		executionRole, cluster, serverLogGroup string
-
-		efsInfo *efsInformation
-
-		netInfo *networkInformation
-
-		server *ecsServer
+		netInfo                                *networkInformation
+		server                                 *ecsServer
+		sess                                   *session.Session
 
 		err error
 	)
@@ -105,28 +101,24 @@ func (i *ECSInstaller) Install(
 			if err != nil {
 				return err
 			}
-			netInfo, err = i.SetupNetworking(ctx, s, sess, ulid)
-			if err != nil {
+
+			if netInfo, err = i.SetupNetworking(ctx, s, sess, ulid); err != nil {
 				return err
 			}
 
-			cluster, err = i.SetupCluster(ctx, s, sess, ulid)
-			if err != nil {
+			if cluster, err = i.SetupCluster(ctx, s, sess, ulid); err != nil {
 				return err
 			}
 
-			efsInfo, err = i.SetupEFS(ctx, s, sess, netInfo, ulid)
-			if err != nil {
+			if efsInfo, err = i.SetupEFS(ctx, s, sess, netInfo, ulid); err != nil {
 				return err
 			}
 
-			executionRole, err = i.SetupExecutionRole(ctx, s, log, sess, ulid)
-			if err != nil {
+			if executionRole, err = i.SetupExecutionRole(ctx, s, log, sess, ulid); err != nil {
 				return err
 			}
 
-			serverLogGroup, err = i.SetupLogs(ctx, s, log, sess, ulid, defaultServerLogGroup)
-			if err != nil {
+			if serverLogGroup, err = i.SetupLogs(ctx, s, log, sess, ulid, defaultServerLogGroup); err != nil {
 				return err
 			}
 
@@ -146,10 +138,8 @@ func (i *ECSInstaller) Install(
 	}
 
 	// Set our connection information
-	// var advertiseAddr pb.ServerConfig_AdvertiseAddr
 	grpcAddr := fmt.Sprintf("%s:%s", server.Url, grpcPort)
 	httpAddr := fmt.Sprintf("%s:%s", server.Url, httpPort)
-	// Set our advertise address
 	advertiseAddr := pb.ServerConfig_AdvertiseAddr{
 		Addr:          grpcAddr,
 		Tls:           true,

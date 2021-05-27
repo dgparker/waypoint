@@ -10,6 +10,7 @@ export default Model.extend({
   build: belongsTo(),
   status: belongsTo({ inverse: 'owner' }),
   component: belongsTo({ inverse: 'owner' }),
+  generation: belongsTo(),
 
   toProtobuf(): Deployment {
     let result = new Deployment();
@@ -18,8 +19,7 @@ export default Model.extend({
     result.setArtifactId(this.artifactId);
     result.setComponent(this.component?.toProtobuf());
     // TODO: result.setDeployment
-    // TODO: result.setExtension
-    // TODO: result.setGeneration
+    result.setGeneration(this.generation?.toProtobuf());
     result.setHasEntrypointConfig(this.hasEntrypointConfig);
     result.setHasExecPlugin(this.hasExecPlugin);
     result.setHasLogsPlugin(this.hasLogsPlugin);

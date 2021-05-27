@@ -146,17 +146,16 @@ func (i *ECSInstaller) Install(
 	}
 
 	// Set our connection information
-	var contextConfig clicontext.Config
-	var advertiseAddr pb.ServerConfig_AdvertiseAddr
-	var httpAddr string
-	var grpcAddr string
-	grpcAddr = fmt.Sprintf("%s:%s", server.Url, grpcPort)
-	httpAddr = fmt.Sprintf("%s:%s", server.Url, httpPort)
+	// var advertiseAddr pb.ServerConfig_AdvertiseAddr
+	grpcAddr := fmt.Sprintf("%s:%s", server.Url, grpcPort)
+	httpAddr := fmt.Sprintf("%s:%s", server.Url, httpPort)
 	// Set our advertise address
-	advertiseAddr.Addr = grpcAddr
-	advertiseAddr.Tls = true
-	advertiseAddr.TlsSkipVerify = true
-	contextConfig = clicontext.Config{
+	advertiseAddr := pb.ServerConfig_AdvertiseAddr{
+		Addr:          grpcAddr,
+		Tls:           true,
+		TlsSkipVerify: true,
+	}
+	contextConfig := clicontext.Config{
 		Server: serverconfig.Client{
 			Address:       grpcAddr,
 			Tls:           true,
@@ -265,6 +264,9 @@ func (i *ECSInstaller) Upgrade(
 			Cluster:  &clusterArn,
 			Services: []*string{serverSvc.ServiceName},
 		})
+		if err != nil {
+			return nil, err
+		}
 	} else {
 		containerDef.Image = &upgradeImg
 		// update task definition
@@ -300,6 +302,9 @@ func (i *ECSInstaller) Upgrade(
 			Cluster:  &clusterArn,
 			Services: []*string{serverSvc.ServiceName},
 		})
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	var contextConfig clicontext.Config
@@ -373,7 +378,7 @@ func (i *ECSInstaller) Uninstall(
 		return err
 	}
 	s.Status("Deleting Cloud Watch Log Group resources...")
-	if err := deleteCWLResources(ctx, s, sess, resources); err != nil {
+	if err := deleteCWLResources(ctx, s, sess, defaultServerLogGroup); err != nil {
 		return err
 	}
 	s.Status("Deleting EFS resources...")
@@ -549,24 +554,16 @@ func deleteCWLResources(
 	ctx context.Context,
 	s LifecycleStatus,
 	sess *session.Session,
-	resources []*resourcegroups.ResourceIdentifier,
+	logGroup string,
 ) error {
 	cwlSvc := cloudwatchlogs.New(sess)
-	groups, err := cwlSvc.DescribeLogGroups(&cloudwatchlogs.DescribeLogGroupsInput{
-		LogGroupNamePrefix: aws.String("waypoint"),
+
+	s.Update("Deleting Log Group %s", logGroup)
+	_, err := cwlSvc.DeleteLogGroup(&cloudwatchlogs.DeleteLogGroupInput{
+		LogGroupName: aws.String(logGroup),
 	})
 	if err != nil {
 		return err
-	}
-
-	for _, l := range groups.LogGroups {
-		s.Update("Deleting Log Group %s", *l.LogGroupName)
-		_, err := cwlSvc.DeleteLogGroup(&cloudwatchlogs.DeleteLogGroupInput{
-			LogGroupName: l.LogGroupName,
-		})
-		if err != nil {
-			return err
-		}
 	}
 	return nil
 }
@@ -585,62 +582,12 @@ func deleteEcsResources(
 			clusterArn = *r.ResourceArn
 		}
 	}
-
-	results, err := ecsSvc.ListServices(&ecs.ListServicesInput{
-		Cluster: &clusterArn,
-	})
-	if err != nil {
+	if err := deleteEcsCommonResources(ctx, s, sess, clusterArn, resources); err != nil {
 		return err
-	}
-
-	for _, service := range results.ServiceArns {
-		s.Update("Deleting ECS service: %s", *service)
-		_, err := ecsSvc.DeleteService(&ecs.DeleteServiceInput{
-			Service: service,
-			Force:   aws.Bool(true),
-			Cluster: &clusterArn,
-		})
-		if err != nil {
-			return err
-		}
-	}
-
-	runningTasks, err := ecsSvc.ListTasks(&ecs.ListTasksInput{
-		Cluster:       &clusterArn,
-		DesiredStatus: aws.String(ecs.DesiredStatusRunning),
-	})
-	if err != nil {
-		return err
-	}
-
-	for _, task := range runningTasks.TaskArns {
-		_, err := ecsSvc.StopTask(&ecs.StopTaskInput{
-			Cluster: &clusterArn,
-			Task:    task,
-		})
-		if err != nil {
-			return err
-		}
-	}
-
-	err = ecsSvc.WaitUntilServicesInactive(&ecs.DescribeServicesInput{
-		Cluster:  &clusterArn,
-		Services: results.ServiceArns,
-	})
-	for _, r := range resources {
-		if *r.ResourceType == "AWS::ECS::TaskDefinition" {
-			s.Update("Deregistering ECS task: %s", *r.ResourceArn)
-			_, err := ecsSvc.DeregisterTaskDefinition(&ecs.DeregisterTaskDefinitionInput{
-				TaskDefinition: r.ResourceArn,
-			})
-			if err != nil {
-				return err
-			}
-		}
 	}
 
 	s.Update("Deleting ECS cluster: %s", clusterArn)
-	_, err = ecsSvc.DeleteCluster(&ecs.DeleteClusterInput{
+	_, err := ecsSvc.DeleteCluster(&ecs.DeleteClusterInput{
 		Cluster: &clusterArn,
 	})
 	if err != nil {
@@ -650,38 +597,30 @@ func deleteEcsResources(
 	return nil
 }
 
-func deleteRunnerResources(
+func deleteEcsCommonResources(
 	ctx context.Context,
 	s LifecycleStatus,
 	sess *session.Session,
+	clusterArn string,
 	resources []*resourcegroups.ResourceIdentifier,
 ) error {
 	ecsSvc := ecs.New(sess)
 
-	var clusterArn string
+	var serviceArn string
 	for _, r := range resources {
-		if *r.ResourceType == "AWS::ECS::Cluster" {
-			clusterArn = *r.ResourceArn
+		if *r.ResourceType == "AWS::ECS::Service" {
+			serviceArn = *r.ResourceArn
 		}
 	}
 
-	results, err := ecsSvc.ListServices(&ecs.ListServicesInput{
+	s.Update("Deleting ECS service: %s", serviceArn)
+	_, err := ecsSvc.DeleteService(&ecs.DeleteServiceInput{
+		Service: &serviceArn,
+		Force:   aws.Bool(true),
 		Cluster: &clusterArn,
 	})
 	if err != nil {
-		return nil
-	}
-
-	for _, service := range results.ServiceArns {
-		s.Update("Deleting ECS service: %s", *service)
-		_, err := ecsSvc.DeleteService(&ecs.DeleteServiceInput{
-			Service: service,
-			Force:   aws.Bool(true),
-			Cluster: &clusterArn,
-		})
-		if err != nil {
-			return err
-		}
+		return err
 	}
 
 	runningTasks, err := ecsSvc.ListTasks(&ecs.ListTasksInput{
@@ -704,8 +643,11 @@ func deleteRunnerResources(
 
 	err = ecsSvc.WaitUntilServicesInactive(&ecs.DescribeServicesInput{
 		Cluster:  &clusterArn,
-		Services: results.ServiceArns,
+		Services: []*string{&serviceArn},
 	})
+	if err != nil {
+		return err
+	}
 	for _, r := range resources {
 		if *r.ResourceType == "AWS::ECS::TaskDefinition" {
 			s.Update("Deregistering ECS task: %s", *r.ResourceArn)
@@ -828,12 +770,18 @@ func (i *ECSInstaller) UninstallRunner(
 	}
 
 	resources := results.ResourceIdentifiers
+	var clusterArn string
+	for _, r := range resources {
+		if *r.ResourceType == "AWS::ECS::Cluster" {
+			clusterArn = *r.ResourceArn
+		}
+	}
 	s.Status("Deleting ECS resources...")
-	if err := deleteRunnerResources(ctx, s, sess, resources); err != nil {
+	if err := deleteEcsCommonResources(ctx, s, sess, clusterArn, resources); err != nil {
 		return err
 	}
 	s.Status("Deleting Cloud Watch Log Group resources...")
-	if err := deleteCWLResources(ctx, s, sess, resources); err != nil {
+	if err := deleteCWLResources(ctx, s, sess, defaultRunnerLogGroup); err != nil {
 		return err
 	}
 	return nil
@@ -1145,6 +1093,7 @@ func (i *ECSInstaller) SetupEFS(
 	}
 	s.Update("Created new EFS file system: %s", *fsd.FileSystemId)
 
+EFSLOOP:
 	for i := 0; i < 10; i++ {
 		fsList, err := efsSvc.DescribeFileSystems(&efs.DescribeFileSystemsInput{
 			FileSystemId: fsd.FileSystemId,
@@ -1161,7 +1110,7 @@ func (i *ECSInstaller) SetupEFS(
 		case efs.LifeCycleStateDeleted, efs.LifeCycleStateDeleting:
 			return nil, fmt.Errorf("files system is deleting/deleted")
 		case efs.LifeCycleStateAvailable:
-			break
+			break EFSLOOP
 		}
 		time.Sleep(2 * time.Second)
 	}

@@ -162,6 +162,213 @@ func (i *ECSInstaller) Install(
 	}, nil
 }
 
+// Launch takes the previously created resource and launches the Waypoint server
+// service
+func (i *ECSInstaller) Launch(
+	ctx context.Context,
+	s LifecycleStatus,
+	log hclog.Logger,
+	ui terminal.UI,
+	sess *session.Session,
+	efsInfo *efsInformation,
+	netInfo *networkInformation,
+	executionRoleArn, clusterName, logGroup, ulid string,
+) (*ecsServer, error) {
+	s.Status("Installing Waypoint server into ECS...")
+
+	ecsSvc := ecs.New(sess)
+
+	defaultStreamPrefix := fmt.Sprintf("waypoint-server-%d", time.Now().Nanosecond())
+	logOptions := buildLoggingOptions(
+		nil,
+		i.config.region,
+		logGroup,
+		defaultStreamPrefix,
+	)
+
+	grpcPort, _ := strconv.Atoi(defaultGrpcPort)
+	httpPort, _ := strconv.Atoi(defaultHttpPort)
+
+	cmd := []*string{
+		aws.String("server"),
+		aws.String("run"),
+		aws.String("-accept-tos"),
+		aws.String("-vvv"),
+		aws.String("-db=/waypoint-data/data.db"),
+		aws.String(fmt.Sprintf("-listen-grpc=0.0.0.0:%d", grpcPort)),
+		aws.String(fmt.Sprintf("-listen-http=0.0.0.0:%d", httpPort)),
+	}
+
+	def := ecs.ContainerDefinition{
+		Essential: aws.Bool(true),
+		Command:   cmd,
+		Name:      aws.String(serverName),
+		Image:     aws.String(i.config.serverImage),
+		PortMappings: []*ecs.PortMapping{
+			{
+				ContainerPort: aws.Int64(int64(httpPort)),
+			},
+			{
+				ContainerPort: aws.Int64(int64(grpcPort)),
+			},
+		},
+		LogConfiguration: &ecs.LogConfiguration{
+			LogDriver: aws.String(ecs.LogDriverAwslogs),
+			Options:   logOptions,
+		},
+		MountPoints: []*ecs.MountPoint{
+			{
+				SourceVolume:  aws.String("waypointdata"),
+				ContainerPath: aws.String("/waypoint-data"),
+			},
+		},
+	}
+
+	s.Status("Creating Network resources...")
+	nlb, err := createNLB(
+		ctx, s, log, sess,
+		netInfo.vpcID,
+		aws.Int64(int64(grpcPort)),
+		netInfo.subnets,
+		ulid,
+	)
+	if err != nil {
+		return nil, err
+	}
+	s.Update("Created Network resources")
+
+	// Create mount points for the EFS file system. The EFS mount targets need to
+	// existin in a 1:1 pair with the subnets in use.
+	s.Status("Creating ECS Service and Tasks...")
+	log.Debug("registering task definition", "ulid", ulid)
+
+	cpus := aws.String(strconv.Itoa(defaultTaskCPU))
+	mems := strconv.Itoa(defaultTaskMemory)
+
+	s.Update("Registering Task definition: %s", defaultTaskFamily)
+
+	registerTaskDefinitionInput := ecs.RegisterTaskDefinitionInput{
+		ContainerDefinitions:    []*ecs.ContainerDefinition{&def},
+		ExecutionRoleArn:        aws.String(executionRoleArn),
+		Cpu:                     cpus,
+		Memory:                  aws.String(mems),
+		Family:                  aws.String(defaultTaskFamily),
+		NetworkMode:             aws.String("awsvpc"),
+		RequiresCompatibilities: []*string{aws.String(defaultTaskRuntime)},
+		Tags: []*ecs.Tag{
+			{
+				Key:   aws.String(serverName),
+				Value: aws.String(ulid),
+			},
+		},
+		Volumes: []*ecs.Volume{
+			{
+				Name: aws.String("waypointdata"),
+				EfsVolumeConfiguration: &ecs.EFSVolumeConfiguration{
+					TransitEncryption: aws.String(ecs.EFSTransitEncryptionEnabled),
+					FileSystemId:      efsInfo.fileSystemID,
+					AuthorizationConfig: &ecs.EFSAuthorizationConfig{
+						AccessPointId: efsInfo.accessPointID,
+					},
+				},
+			},
+		},
+	}
+
+	taskDef, err := registerTaskDefinition(&registerTaskDefinitionInput, ecsSvc)
+	if err != nil {
+		return nil, err
+	}
+
+	taskDefArn := *taskDef.TaskDefinitionArn
+
+	// Create the service
+	s.Update("Creating Service...")
+	log.Debug("creating service", "arn", *taskDef.TaskDefinitionArn)
+
+	createServiceInput := &ecs.CreateServiceInput{
+		Cluster:                       &clusterName,
+		DesiredCount:                  aws.Int64(1),
+		LaunchType:                    aws.String(defaultTaskRuntime),
+		ServiceName:                   aws.String(serverName),
+		TaskDefinition:                aws.String(taskDefArn),
+		HealthCheckGracePeriodSeconds: aws.Int64(int64(600)),
+		NetworkConfiguration: &ecs.NetworkConfiguration{
+			AwsvpcConfiguration: &ecs.AwsVpcConfiguration{
+				Subnets:        netInfo.subnets,
+				SecurityGroups: []*string{netInfo.sgID},
+				AssignPublicIp: aws.String("ENABLED"),
+			},
+		},
+		Tags: []*ecs.Tag{
+			{
+				Key:   aws.String(serverName),
+				Value: aws.String(ulid),
+			},
+		},
+		LoadBalancers: []*ecs.LoadBalancer{
+			{
+				ContainerName:  aws.String("waypoint-server"),
+				ContainerPort:  aws.Int64(int64(httpPort)),
+				TargetGroupArn: aws.String(nlb.httpTgArn),
+			},
+			{
+				ContainerName:  aws.String("waypoint-server"),
+				ContainerPort:  aws.Int64(int64(grpcPort)),
+				TargetGroupArn: aws.String(nlb.grpcTgArn),
+			},
+		},
+	}
+
+	s.Status("Creating ECS Service (%s, cluster-name: %s)", serviceName, clusterName)
+
+	service, err := createService(createServiceInput, ecsSvc)
+	if err != nil {
+		return nil, err
+	}
+
+	s.Update("Created ECS Service (%s, cluster-name: %s)", serviceName, clusterName)
+	log.Debug("service started", "arn", service.ServiceArn)
+
+	// after the service is created with the specified target groups, the load
+	// balancer will start making health checks.
+	s.Update("Waiting for target group to be healthy...")
+	elbsrv := elbv2.New(sess)
+	var healthy bool
+	for i := 0; i < 80; i++ {
+		health, err := elbsrv.DescribeTargetHealth(&elbv2.DescribeTargetHealthInput{
+			TargetGroupArn: &nlb.httpTgArn,
+		})
+		if err != nil {
+			return nil, err
+		}
+		// it's possible no health descriptions are available yet
+		if len(health.TargetHealthDescriptions) > 0 {
+			// grab the first, most recent
+			hd := health.TargetHealthDescriptions[0]
+
+			if hd.TargetHealth.State != nil && *hd.TargetHealth.State == elbv2.TargetHealthStateEnumHealthy {
+				healthy = true
+				break
+			}
+		}
+		time.Sleep(5 * time.Second)
+	}
+
+	if !healthy {
+		return nil, fmt.Errorf("no healthy target group")
+	}
+	s.Status("Service launched!")
+
+	return &ecsServer{
+		Url:                nlb.publicDNS,
+		Cluster:            clusterName,
+		TaskArn:            taskDefArn,
+		HttpTargetGroupArn: nlb.httpTgArn,
+		ServiceArn:         *service.ServiceArn,
+	}, nil
+}
+
 // Upgrade is a method of ECSInstaller and implements the Installer interface to
 // upgrade a waypoint-server in a ecs cluster
 func (i *ECSInstaller) Upgrade(
@@ -415,6 +622,7 @@ func deleteEFSResources(
 			return err
 		}
 	}
+
 	for i := 0; 1 < 30; i++ {
 		mtgs, err := efsSvc.DescribeMountTargets(&efs.DescribeMountTargetsInput{
 			FileSystemId: &id,
@@ -1220,211 +1428,6 @@ type nlb struct {
 	publicDNS string
 }
 
-func (i *ECSInstaller) Launch(
-	ctx context.Context,
-	s LifecycleStatus,
-	log hclog.Logger,
-	ui terminal.UI,
-	sess *session.Session,
-	efsInfo *efsInformation,
-	netInfo *networkInformation,
-	executionRoleArn, clusterName, logGroup, ulid string,
-) (*ecsServer, error) {
-	s.Status("Installing Waypoint server into ECS...")
-
-	ecsSvc := ecs.New(sess)
-
-	defaultStreamPrefix := fmt.Sprintf("waypoint-server-%d", time.Now().Nanosecond())
-	logOptions := buildLoggingOptions(
-		nil,
-		i.config.region,
-		logGroup,
-		defaultStreamPrefix,
-	)
-
-	grpcPort, _ := strconv.Atoi(defaultGrpcPort)
-	httpPort, _ := strconv.Atoi(defaultHttpPort)
-
-	cmd := []*string{
-		aws.String("server"),
-		aws.String("run"),
-		aws.String("-accept-tos"),
-		aws.String("-vvv"),
-		aws.String("-db=/waypoint-data/data.db"),
-		aws.String(fmt.Sprintf("-listen-grpc=0.0.0.0:%d", grpcPort)),
-		aws.String(fmt.Sprintf("-listen-http=0.0.0.0:%d", httpPort)),
-	}
-
-	def := ecs.ContainerDefinition{
-		Essential: aws.Bool(true),
-		Command:   cmd,
-		Name:      aws.String(serverName),
-		Image:     aws.String(i.config.serverImage),
-		PortMappings: []*ecs.PortMapping{
-			{
-				ContainerPort: aws.Int64(int64(httpPort)),
-			},
-			{
-				ContainerPort: aws.Int64(int64(grpcPort)),
-			},
-		},
-		LogConfiguration: &ecs.LogConfiguration{
-			LogDriver: aws.String(ecs.LogDriverAwslogs),
-			Options:   logOptions,
-		},
-		MountPoints: []*ecs.MountPoint{
-			{
-				SourceVolume:  aws.String("waypointdata"),
-				ContainerPath: aws.String("/waypoint-data"),
-			},
-		},
-	}
-
-	s.Status("Creating Network resources...")
-	nlb, err := createNLB(
-		ctx, s, log, sess,
-		netInfo.vpcID,
-		aws.Int64(int64(grpcPort)),
-		netInfo.subnets,
-		ulid,
-	)
-	if err != nil {
-		return nil, err
-	}
-	s.Update("Created Network resources")
-
-	// Create mount points for the EFS file system. The EFS mount targets need to
-	// existin in a 1:1 pair with the subnets in use.
-	s.Status("Creating ECS Service and Tasks...")
-	log.Debug("registering task definition", "ulid", ulid)
-
-	cpus := aws.String(strconv.Itoa(defaultTaskCPU))
-	mems := strconv.Itoa(defaultTaskMemory)
-
-	s.Update("Registering Task definition: %s", defaultTaskFamily)
-
-	registerTaskDefinitionInput := ecs.RegisterTaskDefinitionInput{
-		ContainerDefinitions:    []*ecs.ContainerDefinition{&def},
-		ExecutionRoleArn:        aws.String(executionRoleArn),
-		Cpu:                     cpus,
-		Memory:                  aws.String(mems),
-		Family:                  aws.String(defaultTaskFamily),
-		NetworkMode:             aws.String("awsvpc"),
-		RequiresCompatibilities: []*string{aws.String(defaultTaskRuntime)},
-		Tags: []*ecs.Tag{
-			{
-				Key:   aws.String(serverName),
-				Value: aws.String(ulid),
-			},
-		},
-		Volumes: []*ecs.Volume{
-			{
-				Name: aws.String("waypointdata"),
-				EfsVolumeConfiguration: &ecs.EFSVolumeConfiguration{
-					TransitEncryption: aws.String(ecs.EFSTransitEncryptionEnabled),
-					FileSystemId:      efsInfo.fileSystemID,
-					AuthorizationConfig: &ecs.EFSAuthorizationConfig{
-						AccessPointId: efsInfo.accessPointID,
-					},
-				},
-			},
-		},
-	}
-
-	taskDef, err := registerTaskDefinition(&registerTaskDefinitionInput, ecsSvc)
-	if err != nil {
-		return nil, err
-	}
-
-	taskDefArn := *taskDef.TaskDefinitionArn
-
-	// Create the service
-	s.Update("Creating Service...")
-	log.Debug("creating service", "arn", *taskDef.TaskDefinitionArn)
-
-	createServiceInput := &ecs.CreateServiceInput{
-		Cluster:                       &clusterName,
-		DesiredCount:                  aws.Int64(1),
-		LaunchType:                    aws.String(defaultTaskRuntime),
-		ServiceName:                   aws.String(serverName),
-		TaskDefinition:                aws.String(taskDefArn),
-		HealthCheckGracePeriodSeconds: aws.Int64(int64(600)),
-		NetworkConfiguration: &ecs.NetworkConfiguration{
-			AwsvpcConfiguration: &ecs.AwsVpcConfiguration{
-				Subnets:        netInfo.subnets,
-				SecurityGroups: []*string{netInfo.sgID},
-				AssignPublicIp: aws.String("ENABLED"),
-			},
-		},
-		Tags: []*ecs.Tag{
-			{
-				Key:   aws.String(serverName),
-				Value: aws.String(ulid),
-			},
-		},
-		LoadBalancers: []*ecs.LoadBalancer{
-			{
-				ContainerName:  aws.String("waypoint-server"),
-				ContainerPort:  aws.Int64(int64(httpPort)),
-				TargetGroupArn: aws.String(nlb.httpTgArn),
-			},
-			{
-				ContainerName:  aws.String("waypoint-server"),
-				ContainerPort:  aws.Int64(int64(grpcPort)),
-				TargetGroupArn: aws.String(nlb.grpcTgArn),
-			},
-		},
-	}
-
-	s.Status("Creating ECS Service (%s, cluster-name: %s)", serviceName, clusterName)
-
-	service, err := createService(createServiceInput, ecsSvc)
-	if err != nil {
-		return nil, err
-	}
-
-	s.Update("Created ECS Service (%s, cluster-name: %s)", serviceName, clusterName)
-	log.Debug("service started", "arn", service.ServiceArn)
-
-	// after the service is created with the specified target groups, the load
-	// balancer will start making health checks.
-	s.Update("Waiting for target group to be healthy...")
-	elbsrv := elbv2.New(sess)
-	var healthy bool
-	for i := 0; i < 80; i++ {
-		health, err := elbsrv.DescribeTargetHealth(&elbv2.DescribeTargetHealthInput{
-			TargetGroupArn: &nlb.httpTgArn,
-		})
-		if err != nil {
-			return nil, err
-		}
-		// it's possible no health descriptions are available yet
-		if len(health.TargetHealthDescriptions) > 0 {
-			// grab the first, most recent
-			hd := health.TargetHealthDescriptions[0]
-
-			if hd.TargetHealth.State != nil && *hd.TargetHealth.State == elbv2.TargetHealthStateEnumHealthy {
-				healthy = true
-				break
-			}
-		}
-		time.Sleep(5 * time.Second)
-	}
-
-	if !healthy {
-		return nil, fmt.Errorf("no healthy target group")
-	}
-	s.Status("Service launched!")
-
-	return &ecsServer{
-		Url:                nlb.publicDNS,
-		Cluster:            clusterName,
-		TaskArn:            taskDefArn,
-		HttpTargetGroupArn: nlb.httpTgArn,
-		ServiceArn:         *service.ServiceArn,
-	}, nil
-}
-
 func createSG(
 	ctx context.Context,
 	s LifecycleStatus,
@@ -1696,11 +1699,10 @@ func createNLB(
 	elbsrv := elbv2.New(sess)
 
 	ctgGPRC, err := elbsrv.CreateTargetGroup(&elbv2.CreateTargetGroupInput{
-		Name:       aws.String("waypoint-server-grpc"),
-		Port:       grpcPort,
-		Protocol:   aws.String("TCP"),
-		TargetType: aws.String("ip"),
-		// HealthCheckIntervalSeconds: aws.Int64(int64(10)),
+		Name:                    aws.String("waypoint-server-grpc"),
+		Port:                    grpcPort,
+		Protocol:                aws.String("TCP"),
+		TargetType:              aws.String("ip"),
 		HealthyThresholdCount:   aws.Int64(int64(2)),
 		UnhealthyThresholdCount: aws.Int64(int64(2)),
 		VpcId:                   vpcId,
@@ -1716,10 +1718,9 @@ func createNLB(
 	}
 
 	htgGPRC, err := elbsrv.CreateTargetGroup(&elbv2.CreateTargetGroupInput{
-		Name:                aws.String("waypoint-server-http"),
-		HealthCheckProtocol: aws.String(elbv2.ProtocolEnumHttps),
-		HealthCheckPath:     aws.String("/auth"),
-		// HealthCheckIntervalSeconds: aws.Int64(int64(10)),
+		Name:                    aws.String("waypoint-server-http"),
+		HealthCheckProtocol:     aws.String(elbv2.ProtocolEnumHttps),
+		HealthCheckPath:         aws.String("/auth"),
 		HealthyThresholdCount:   aws.Int64(int64(2)),
 		UnhealthyThresholdCount: aws.Int64(int64(2)),
 		Port:                    aws.Int64(int64(9702)),

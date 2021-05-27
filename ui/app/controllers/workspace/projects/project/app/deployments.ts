@@ -20,8 +20,32 @@ export default class WorkspaceProjectsProjectAppDeployments extends Controller {
     }
   }
 
+  get deploymentsByGeneration(): GenerationGroup[] {
+    let result: GenerationGroup[] = [];
+
+    for (let deployment of this.deployments) {
+      let id = deployment.generation?.id ?? deployment.id;
+      let group = result.find((group) => group.generationID === id);
+
+      if (!group) {
+        group = new GenerationGroup(id);
+        result.push(group);
+      }
+
+      group.deployments.push(deployment);
+    }
+
+    return result;
+  }
+
   @action
   showDestroyed(): void {
     this.destroyed = true;
   }
+}
+
+class GenerationGroup {
+  deployments: Deployment.AsObject[] = [];
+
+  constructor(public generationID: string) {}
 }
